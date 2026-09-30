@@ -1,14 +1,12 @@
 import os
 import json
 import asyncio
-from urllib.parse import quote
 
 import aiohttp
 from bs4 import BeautifulSoup
 
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 
 
 # =========================================================
@@ -17,22 +15,14 @@ from discord import app_commands
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# TÊN 2 KÊNH DISCORD
 NOTIFICATION_CHANNEL_NAME = "thong-bao-game"
 SEARCH_CHANNEL_NAME = "tim-game"
 
-# Cứ bao nhiêu phút kiểm tra game free
 CHECK_INTERVAL_MINUTES = 15
 
-# File lưu game đã gửi
 DATA_FILE = "bot_data.json"
 
-# False:
-# Lần đầu bot chạy sẽ ghi nhớ các game đang free nhưng
-# không gửi hàng loạt game cũ.
-#
-# True:
-# Lần đầu chạy sẽ gửi tất cả game đang free tìm được.
+# False = lần đầu chạy không spam các game đang free
 ANNOUNCE_EXISTING_ON_FIRST_RUN = False
 
 
@@ -50,7 +40,7 @@ bot = commands.Bot(
 
 
 # =========================================================
-# HTTP
+# HTTP SESSION
 # =========================================================
 
 http_session = None
@@ -93,11 +83,7 @@ def load_data():
         return DEFAULT_DATA.copy()
 
     try:
-        with open(
-            DATA_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         for key, value in DEFAULT_DATA.items():
@@ -113,11 +99,7 @@ def load_data():
 
 def save_data():
     try:
-        with open(
-            DATA_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(
                 data,
                 f,
@@ -133,17 +115,10 @@ data = load_data()
 
 
 # =========================================================
-# GENERAL HELPERS
+# HELPERS
 # =========================================================
 
 def normalize_channel_name(name):
-    """
-    Cho phép:
-    thong-bao-game
-    Thong-Bao-Game
-    thong bao game
-    thong_bao_game
-    """
     return (
         name
         .lower()
@@ -154,24 +129,21 @@ def normalize_channel_name(name):
 
 def format_vnd(value):
     try:
-        value = float(value)
-        return f"{round(value):,}₫".replace(",", ".")
+        return f"{round(float(value)):,}₫".replace(",", ".")
     except Exception:
         return "N/A"
 
 
 def format_krw(value):
     try:
-        value = float(value)
-        return f"₩{round(value):,}"
+        return f"₩{round(float(value)):,}"
     except Exception:
         return "N/A"
 
 
 def format_usd(value):
     try:
-        value = float(value)
-        return f"${value:,.2f}"
+        return f"${float(value):,.2f}"
     except Exception:
         return "N/A"
 
@@ -215,18 +187,14 @@ def game_key(store, game_id):
 
 
 # =========================================================
-# FIND CHANNELS AUTOMATICALLY
+# CHANNEL FINDER
 # =========================================================
 
 def find_channel(guild, wanted_name):
-    wanted = normalize_channel_name(
-        wanted_name
-    )
+    wanted = normalize_channel_name(wanted_name)
 
     for channel in guild.text_channels:
-        current = normalize_channel_name(
-            channel.name
-        )
+        current = normalize_channel_name(channel.name)
 
         if current == wanted:
             return channel
@@ -235,11 +203,6 @@ def find_channel(guild, wanted_name):
 
 
 def find_notification_channel():
-    """
-    Tìm #thong-bao-game trong tất cả server
-    mà bot đang tham gia.
-    """
-
     for guild in bot.guilds:
         channel = find_channel(
             guild,
@@ -313,19 +276,10 @@ async def get_epic_free_games():
             if not title:
                 continue
 
-            promotions = game.get(
-                "promotions"
-            ) or {}
+            promotions = game.get("promotions") or {}
 
-            # Nếu Epic không có promotion data,
-            # bỏ qua để tránh nhận game bình thường.
             offers = (
                 promotions.get("promotionalOffers")
-                or []
-            )
-
-            upcoming = (
-                promotions.get("upcomingPromotionalOffers")
                 or []
             )
 
@@ -342,13 +296,6 @@ async def get_epic_free_games():
                 if current_offer:
                     break
 
-            # Một số response không cần check offer,
-            # nhưng nếu có dữ liệu offer thì phải chắc chắn
-            # đang trong thời gian promotion.
-            if offers and not current_offer:
-                continue
-
-            # Kiểm tra giá.
             price = game.get("price") or {}
 
             total_price = (
@@ -356,15 +303,14 @@ async def get_epic_free_games():
                 or {}
             )
 
-            original_price = (
-                total_price.get("originalPrice")
+            original_price = total_price.get(
+                "originalPrice"
             )
 
-            discount_price = (
-                total_price.get("discountPrice")
+            discount_price = total_price.get(
+                "discountPrice"
             )
 
-            # Epic có thể trả giá dưới dạng số cent.
             try:
                 original_price = float(
                     original_price or 0
@@ -377,22 +323,14 @@ async def get_epic_free_games():
             except Exception:
                 continue
 
-            # Nếu discount price chưa bằng 0
-            # thì không coi là free.
             if discount_price != 0:
                 continue
 
-            # Phải có giá gốc > 0 để tránh F2P.
             if original_price <= 0:
                 continue
 
-            namespace = game.get(
-                "namespace"
-            )
-
-            product_id = game.get(
-                "id"
-            )
+            namespace = game.get("namespace")
+            product_id = game.get("id")
 
             slug = (
                 game.get("productSlug")
@@ -575,10 +513,7 @@ async def epic_search(keyword):
                 game.get("keyImages", [])
             )
 
-            price = (
-                game.get("price")
-                or {}
-            )
+            price = game.get("price") or {}
 
             total = (
                 price.get("totalPrice")
@@ -617,8 +552,10 @@ async def epic_search(keyword):
                 )
             })
 
-        except Exception:
-            continue
+        except Exception as e:
+            print(
+                f"[EPIC SEARCH] Parse error: {e}"
+            )
 
     return games
 
@@ -712,8 +649,6 @@ async def steam_search_page(
             if not appid:
                 continue
 
-            # Có trường hợp Steam trả:
-            # 12345,67890
             appid = str(
                 appid
             ).split(",")[0].strip()
@@ -746,38 +681,10 @@ async def steam_search_page(
                     or img.get("data-src")
                 )
 
-            discount_el = row.select_one(
-                ".search_discount"
-            )
-
-            discount_text = (
-                discount_el.get_text(
-                    " ",
-                    strip=True
-                )
-                if discount_el
-                else ""
-            )
-
-            price_el = row.select_one(
-                ".search_price"
-            )
-
-            price_text = (
-                price_el.get_text(
-                    " ",
-                    strip=True
-                )
-                if price_el
-                else ""
-            )
-
             results.append({
                 "appid": appid,
                 "title": title,
-                "image": image,
-                "discount_text": discount_text,
-                "price_text": price_text
+                "image": image
             })
 
         except Exception:
@@ -831,24 +738,10 @@ async def steam_app_details(
 
 
 # =========================================================
-# STEAM FREE-TO-KEEP
+# STEAM FREE TO KEEP
 # =========================================================
 
 async def get_steam_free_to_keep():
-    """
-    Steam Store search:
-      specials=1
-      maxprice=free
-      hidef2p=1
-
-    Sau đó kiểm tra appdetails để chắc chắn:
-      - type = game
-      - không phải permanent F2P
-      - có price_overview
-      - discount = 100%
-      - giá hiện tại = 0
-      - giá gốc > 0
-    """
 
     candidates = await steam_search_page(
         keyword="",
@@ -859,6 +752,7 @@ async def get_steam_free_to_keep():
     results = []
 
     for candidate in candidates:
+
         appid = candidate["appid"]
 
         details = await steam_app_details(
@@ -873,7 +767,6 @@ async def get_steam_free_to_keep():
         if details.get("type") != "game":
             continue
 
-        # Game vốn Free-to-Play -> bỏ
         if details.get("is_free") is True:
             continue
 
@@ -899,7 +792,6 @@ async def get_steam_free_to_keep():
             0
         )
 
-        # Phải là game trả phí đang giảm 100%
         if initial <= 0:
             continue
 
@@ -909,17 +801,15 @@ async def get_steam_free_to_keep():
         if discount != 100:
             continue
 
-        # Steam Free Weekend / Trial
-        # thường không có cấu trúc giá 100% off
-        # như Free-to-Keep.
-        # Thêm kiểm tra chữ để tránh false positive.
         text = (
             str(details.get("name", ""))
             + " "
-            + str(details.get(
-                "short_description",
-                ""
-            ))
+            + str(
+                details.get(
+                    "short_description",
+                    ""
+                )
+            )
         ).lower()
 
         bad_phrases = [
@@ -965,10 +855,11 @@ async def get_steam_free_to_keep():
 
 
 # =========================================================
-# STEAM GAME SEARCH
+# STEAM SEARCH
 # =========================================================
 
 async def steam_search_game(keyword):
+
     candidates = await steam_search_page(
         keyword=keyword,
         free_only=False,
@@ -978,6 +869,7 @@ async def steam_search_game(keyword):
     results = []
 
     for candidate in candidates[:8]:
+
         appid = candidate["appid"]
 
         details_kr = await steam_app_details(
@@ -1066,18 +958,20 @@ async def steam_search_game(keyword):
 # =========================================================
 
 def build_free_embed(game):
+
     store = game["store"]
 
     embed = discord.Embed(
         title=f"🎁 {game['title']}",
         url=game["url"],
         description=(
-            f"🔥 **FREE TO KEEP**\n\n"
+            "🔥 **FREE TO KEEP**\n\n"
             f"🏪 Store: **{store}**"
         )
     )
 
     if store == "Steam":
+
         original_usd = (
             game.get(
                 "initial_cents",
@@ -1098,6 +992,7 @@ def build_free_embed(game):
         )
 
     else:
+
         original = float(
             game.get(
                 "original_price",
@@ -1131,9 +1026,7 @@ def build_free_embed(game):
         inline=True
     )
 
-    end_date = game.get(
-        "end_date"
-    )
+    end_date = game.get("end_date")
 
     if end_date:
         embed.add_field(
@@ -1158,6 +1051,7 @@ def build_free_embed(game):
 
 
 def build_search_embed(game):
+
     embed = discord.Embed(
         title=f"🎮 {game['title']}",
         url=game["url"],
@@ -1171,23 +1065,11 @@ def build_search_embed(game):
         krw = game.get("krw")
         vnd = game.get("vnd")
 
-        krw_text = (
-            format_krw(krw)
-            if krw is not None
-            else "N/A"
-        )
-
-        vnd_text = (
-            format_vnd(vnd)
-            if vnd is not None
-            else "N/A"
-        )
-
         embed.add_field(
             name="💰 Giá",
             value=(
-                f"🇰🇷 **{krw_text}**\n"
-                f"🇻🇳 **{vnd_text}**"
+                f"🇰🇷 **{format_krw(krw) if krw is not None else 'N/A'}**\n"
+                f"🇻🇳 **{format_vnd(vnd) if vnd is not None else 'N/A'}**"
             ),
             inline=False
         )
@@ -1195,13 +1077,12 @@ def build_search_embed(game):
         if game.get("discount"):
             embed.add_field(
                 name="🏷️ Giảm giá",
-                value=(
-                    f"-{game['discount']}%"
-                ),
+                value=f"-{game['discount']}%",
                 inline=True
             )
 
     else:
+
         original = float(
             game.get(
                 "original_price",
@@ -1224,8 +1105,7 @@ def build_search_embed(game):
         embed.add_field(
             name="💰 Giá hiện tại",
             value=(
-                f"{currency} "
-                f"{current:,.2f}\n"
+                f"{currency} {current:,.2f}\n"
                 f"🇰🇷 ≈ "
                 f"{format_krw(usd_to_krw(current))}\n"
                 f"🇻🇳 ≈ "
@@ -1257,12 +1137,13 @@ def build_search_embed(game):
 
 
 # =========================================================
-# GAME SEARCH MODAL
+# SEARCH MODAL
 # =========================================================
 
 class GameSearchModal(discord.ui.Modal):
 
     def __init__(self, store):
+
         self.store = store
 
         super().__init__(
@@ -1282,10 +1163,8 @@ class GameSearchModal(discord.ui.Modal):
             self.game_name
         )
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
+    async def on_submit(self, interaction):
+
         keyword = str(
             self.game_name.value
         ).strip()
@@ -1294,35 +1173,47 @@ class GameSearchModal(discord.ui.Modal):
             ephemeral=True
         )
 
-        if self.store == "Steam":
-            results = await steam_search_game(
-                keyword
-            )
-        else:
-            results = await epic_search(
-                keyword
+        try:
+
+            if self.store == "Steam":
+                results = await steam_search_game(
+                    keyword
+                )
+            else:
+                results = await epic_search(
+                    keyword
+                )
+
+            if not results:
+                await interaction.followup.send(
+                    f"❌ Không tìm thấy "
+                    f"**{keyword}** trên "
+                    f"{self.store}.",
+                    ephemeral=True
+                )
+                return
+
+            game = results[0]
+
+            embed = build_search_embed(
+                game
             )
 
-        if not results:
             await interaction.followup.send(
-                f"❌ Không tìm thấy "
-                f"**{keyword}** trên "
-                f"{self.store}.",
+                embed=embed,
                 ephemeral=True
             )
-            return
 
-        # Hiện kết quả đầu tiên.
-        game = results[0]
+        except Exception as e:
 
-        embed = build_search_embed(
-            game
-        )
+            print(
+                f"[SEARCH ERROR] {e}"
+            )
 
-        await interaction.followup.send(
-            embed=embed,
-            ephemeral=True
-        )
+            await interaction.followup.send(
+                "❌ Có lỗi khi tìm game.",
+                ephemeral=True
+            )
 
 
 # =========================================================
@@ -1343,8 +1234,8 @@ class GameStoreView(discord.ui.View):
     )
     async def epic_button(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
         await interaction.response.send_modal(
             GameSearchModal("Epic")
@@ -1357,8 +1248,8 @@ class GameStoreView(discord.ui.View):
     )
     async def steam_button(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
         await interaction.response.send_modal(
             GameSearchModal("Steam")
@@ -1373,9 +1264,8 @@ class GameStoreView(discord.ui.View):
     name="game",
     description="Tìm game trên Epic hoặc Steam"
 )
-async def game(
-    interaction: discord.Interaction
-):
+async def game(interaction):
+
     if interaction.guild is None:
         await interaction.response.send_message(
             "❌ Lệnh này chỉ dùng trong server.",
@@ -1424,11 +1314,10 @@ async def game(
 
 @bot.tree.command(
     name="channels",
-    description="Kiểm tra bot đang nhận kênh nào"
+    description="Kiểm tra kênh bot đang sử dụng"
 )
-async def channels(
-    interaction: discord.Interaction
-):
+async def channels(interaction):
+
     notification = find_notification_channel()
 
     search = None
@@ -1439,7 +1328,7 @@ async def channels(
         )
 
     embed = discord.Embed(
-        title="📋 Kênh của Free Game Bot"
+        title="📋 Free Game Bot"
     )
 
     embed.add_field(
@@ -1447,8 +1336,10 @@ async def channels(
         value=(
             notification.mention
             if notification
-            else f"❌ Không tìm thấy "
-                 f"`{NOTIFICATION_CHANNEL_NAME}`"
+            else (
+                "❌ Không tìm thấy "
+                f"`{NOTIFICATION_CHANNEL_NAME}`"
+            )
         ),
         inline=False
     )
@@ -1458,8 +1349,10 @@ async def channels(
         value=(
             search.mention
             if search
-            else f"❌ Không tìm thấy "
-                 f"`{SEARCH_CHANNEL_NAME}`"
+            else (
+                "❌ Không tìm thấy "
+                f"`{SEARCH_CHANNEL_NAME}`"
+            )
         ),
         inline=False
     )
@@ -1475,6 +1368,7 @@ async def channels(
 # =========================================================
 
 async def send_free_game(game):
+
     channel = find_notification_channel()
 
     if channel is None:
@@ -1485,10 +1379,9 @@ async def send_free_game(game):
         return False
 
     try:
+
         await channel.send(
-            embed=build_free_embed(
-                game
-            )
+            embed=build_free_embed(game)
         )
 
         print(
@@ -1500,12 +1393,14 @@ async def send_free_game(game):
         return True
 
     except discord.Forbidden:
+
         print(
             "[CHANNEL] Bot không có quyền "
-            "Send Messages/Embed Links."
+            "Send Messages / Embed Links."
         )
 
     except Exception as e:
+
         print(
             f"[SEND ERROR] {e}"
         )
@@ -1518,6 +1413,7 @@ async def send_free_game(game):
 # =========================================================
 
 async def check_epic():
+
     games = await get_epic_free_games()
 
     print(
@@ -1534,24 +1430,19 @@ async def check_epic():
         if key in data["sent_games"]:
             continue
 
-        # Không spam toàn bộ game cũ lần đầu.
         if (
             not data["initialized"]
             and not ANNOUNCE_EXISTING_ON_FIRST_RUN
         ):
-            data["sent_games"].append(
-                key
-            )
+
+            data["sent_games"].append(key)
+
             continue
 
-        sent = await send_free_game(
-            game
-        )
+        sent = await send_free_game(game)
 
         if sent:
-            data["sent_games"].append(
-                key
-            )
+            data["sent_games"].append(key)
 
         await asyncio.sleep(1)
 
@@ -1563,6 +1454,7 @@ async def check_epic():
 # =========================================================
 
 async def check_steam():
+
     games = await get_steam_free_to_keep()
 
     print(
@@ -1584,19 +1476,15 @@ async def check_steam():
             not data["initialized"]
             and not ANNOUNCE_EXISTING_ON_FIRST_RUN
         ):
-            data["sent_games"].append(
-                key
-            )
+
+            data["sent_games"].append(key)
+
             continue
 
-        sent = await send_free_game(
-            game
-        )
+        sent = await send_free_game(game)
 
         if sent:
-            data["sent_games"].append(
-                key
-            )
+            data["sent_games"].append(key)
 
         await asyncio.sleep(1)
 
@@ -1604,16 +1492,13 @@ async def check_steam():
 
 
 # =========================================================
-# CLEAN OLD SENT IDS
+# CLEAN DATA
 # =========================================================
 
 def clean_sent_games():
-    """
-    Chỉ giữ 2000 ID gần nhất để bot không
-    làm file bot_data.json quá lớn.
-    """
 
     if len(data["sent_games"]) > 2000:
+
         data["sent_games"] = (
             data["sent_games"][-2000:]
         )
@@ -1641,11 +1526,14 @@ async def free_game_checker():
     notification = find_notification_channel()
 
     if notification:
+
         print(
             "[CHANNEL] Thông báo: "
             f"#{notification.name}"
         )
+
     else:
+
         print(
             "[CHANNEL] ❌ Không tìm thấy "
             f"#{NOTIFICATION_CHANNEL_NAME}"
@@ -1653,20 +1541,26 @@ async def free_game_checker():
 
     try:
         await check_epic()
+
     except Exception as e:
+
         print(
             f"[EPIC ERROR] {e}"
         )
 
     try:
         await check_steam()
+
     except Exception as e:
+
         print(
             f"[STEAM ERROR] {e}"
         )
 
     if not data["initialized"]:
+
         data["initialized"] = True
+
         save_data()
 
     clean_sent_games()
@@ -1682,6 +1576,7 @@ async def free_game_checker():
 
 @free_game_checker.before_loop
 async def before_checker():
+
     await bot.wait_until_ready()
 
 
@@ -1704,45 +1599,80 @@ async def on_ready():
         f"📡 Servers: {len(bot.guilds)}"
     )
 
+    # -----------------------------------------
+    # CHECK CHANNELS
+    # -----------------------------------------
+
     notification = find_notification_channel()
 
     if notification:
+
         print(
             "📢 Notification channel: "
             f"#{notification.name}"
         )
+
     else:
+
         print(
             "❌ Notification channel NOT FOUND: "
             f"#{NOTIFICATION_CHANNEL_NAME}"
         )
 
     for guild in bot.guilds:
-        search = find_search_channel(
-            guild
-        )
+
+        search = find_search_channel(guild)
 
         if search:
+
             print(
                 f"🎮 Search channel "
                 f"({guild.name}): "
                 f"#{search.name}"
             )
 
+    # -----------------------------------------
+    # SLASH COMMAND SYNC
+    # -----------------------------------------
+
     try:
-        synced = await bot.tree.sync()
+
+        total = 0
+
+        for guild in bot.guilds:
+
+            # Copy global commands vào server
+            bot.tree.copy_global_to(
+                guild=guild
+            )
+
+            synced = await bot.tree.sync(
+                guild=guild
+            )
+
+            total += len(synced)
+
+            print(
+                f"⚡ Synced {len(synced)} commands "
+                f"→ {guild.name}"
+            )
 
         print(
-            f"⚡ Slash commands synced: "
-            f"{len(synced)}"
+            f"⚡ Tổng số command đã sync: {total}"
         )
 
     except Exception as e:
+
         print(
             f"❌ Slash sync error: {e}"
         )
 
+    # -----------------------------------------
+    # START CHECKER
+    # -----------------------------------------
+
     if not free_game_checker.is_running():
+
         free_game_checker.start()
 
     print(
@@ -1769,31 +1699,38 @@ async def on_app_command_error(
     )
 
     try:
+
         if interaction.response.is_done():
+
             await interaction.followup.send(
                 "❌ Có lỗi xảy ra.",
                 ephemeral=True
             )
+
         else:
+
             await interaction.response.send_message(
                 "❌ Có lỗi xảy ra.",
                 ephemeral=True
             )
+
     except Exception:
         pass
 
 
 # =========================================================
-# CLOSE HTTP SESSION
+# CLOSE HTTP
 # =========================================================
 
 async def close_http_session():
+
     global http_session
 
     if (
         http_session
         and not http_session.closed
     ):
+
         await http_session.close()
 
 
@@ -1804,24 +1741,35 @@ async def close_http_session():
 async def main():
 
     if not DISCORD_TOKEN:
+
         raise RuntimeError(
             "❌ Chưa có DISCORD_TOKEN "
             "trong Railway Variables."
         )
 
     try:
+
         await bot.start(
             DISCORD_TOKEN
         )
 
     finally:
+
         await close_http_session()
 
 
+# =========================================================
+# START
+# =========================================================
+
 if __name__ == "__main__":
+
     try:
+
         asyncio.run(
             main()
         )
+
     except KeyboardInterrupt:
+
         pass
