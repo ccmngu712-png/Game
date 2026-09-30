@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import re
+import html
 import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import quote_plus
@@ -10,6 +11,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 
@@ -26,12 +28,30 @@ DATA_FILE = "bot_data.json"
 
 CHECK_INTERVAL_MINUTES = 15
 
-# False = bot không spam những game đã free từ trước khi bot chạy
+# False = lần đầu bot chạy sẽ không spam các game FREE hiện tại
 ANNOUNCE_EXISTING_ON_FIRST_RUN = False
 
-# Tỷ giá tham khảo cho Epic nếu API không trả trực tiếp
-USD_TO_KRW = 1400
-USD_TO_VND = 25000
+EPIC_GRAPHQL_URLS = [
+    "https://graphql.epicgames.com/graphql",
+    "https://store.epicgames.com/graphql",
+]
+
+EPIC_FREE_URL = (
+    "https://store-site-backend-static.ak.epicgames.com/"
+    "freeGamesPromotions"
+)
+
+STEAM_SEARCH_URL = "https://store.steampowered.com/search/results/"
+STEAM_STORESEARCH_URL = "https://store.steampowered.com/api/storesearch/"
+STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails/"
+
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0 Safari/537.36"
+)
 
 
 # =========================================================
@@ -42,270 +62,124 @@ intents = discord.Intents.default()
 
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents
+    intents=intents,
 )
 
 
 # =========================================================
-# DATA
+# GLOBAL CACHE
+# =========================================================
+
+http_session = None
+
+steam_detail_cache = {}
+epic_search_cache = {}
+steam_search_cache = {}
+
+CACHE_SECONDS = 600
+
+steam_detail_semaphore = asyncio.Semaphore(5)
+
+
+# =========================================================
+# DATABASE
 # =========================================================
 
 def load_data():
-    default = {
-        "epic_sent": [],
-        "steam_sent": [],
-        "epic_schedule_sent": [],
-        "first_run_done": False
-    }
-
     if not os.path.exists(DATA_FILE):
-        return default
+        return {
+            "sent_free_games": [],
+            "first_run_done": False,
+        }
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
+            data = json.load(f)
 
-        for key, value in default.items():
-            saved.setdefault(key, value)
+        if not isinstance(data, dict):
+            raise ValueError("Invalid database")
 
-        return saved
+        data.setdefault("sent_free_games", [])
+        data.setdefault("first_run_done", False)
+
+        return data
 
     except Exception:
-        return default
+        return {
+            "sent_free_games": [],
+            "first_run_done": False,
+        }
+
+
+DATA = load_data()
 
 
 def save_data():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                data,
+                DATA,
                 f,
                 ensure_ascii=False,
-                indent=2
+                indent=2,
             )
     except Exception as e:
-        print("❌ Không lưu được data:", e)
-
-
-data = load_data()
+        print("DATABASE SAVE ERROR:", e)
 
 
 # =========================================================
-# CHANNEL
+# HELPERS
 # =========================================================
 
-def normalize_channel_name(name: str):
-    name = name.strip().lower()
-
-    if "・" in name:
-        name = name.split("・", 1)[1]
-
-    name = name.replace("_", "-")
-    name = name.replace(" ", "-")
-
-    return name
-
-
-def find_channel(guild: discord.Guild, wanted_name: str):
-    wanted = normalize_channel_name(wanted_name)
-
-    for channel in guild.text_channels:
-        if normalize_channel_name(channel.name) == wanted:
-            return channel
-
-    return None
-
-
-def get_notification_channel():
-    for guild in bot.guilds:
-        channel = find_channel(
-            guild,
-            NOTIFICATION_CHANNEL_NAME
-        )
-
-        if channel:
-            return channel
-
-    return None
-
-
-def get_search_channel():
-    for guild in bot.guilds:
-        channel = find_channel(
-            guild,
-            SEARCH_CHANNEL_NAME
-        )
-
-        if channel:
-            return channel
-
-    return None
-
-
-# =========================================================
-# HTTP
-# =========================================================
-
-async def get_json(session, url, **kwargs):
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        async with session.get(
-            url,
-            timeout=timeout,
-            **kwargs
-        ) as response:
-
-            if response.status != 200:
-                print(
-                    f"⚠️ HTTP {response.status}: {url}"
-                )
-                return None
-
-            return await response.json(
-                content_type=None
-            )
-
-    except Exception as e:
-        print("HTTP JSON error:", e)
-        return None
-
-
-async def get_text(session, url, **kwargs):
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        async with session.get(
-            url,
-            timeout=timeout,
-            **kwargs
-        ) as response:
-
-            if response.status != 200:
-                return None
-
-            return await response.text()
-
-    except Exception as e:
-        print("HTTP text error:", e)
-        return None
-
-
-async def post_json(
-    session,
-    url,
-    payload,
-    **kwargs
-):
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        async with session.post(
-            url,
-            json=payload,
-            timeout=timeout,
-            **kwargs
-        ) as response:
-
-            if response.status != 200:
-                print(
-                    f"⚠️ POST HTTP {response.status}: {url}"
-                )
-                return None
-
-            return await response.json(
-                content_type=None
-            )
-
-    except Exception as e:
-        print("POST JSON error:", e)
-        return None
-
-
-# =========================================================
-# GENERAL HELPERS
-# =========================================================
-
-def clean_text(text):
-    if not text:
+def clean_text(value):
+    if value is None:
         return ""
 
-    return " ".join(
-        str(text).strip().split()
-    )
+    value = html.unescape(str(value))
+    value = re.sub(r"<[^>]+>", "", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
 
 
-def normalize_text(text):
-    text = clean_text(text)
-
-    text = unicodedata.normalize(
-        "NFKD",
-        text
-    )
-
-    text = "".join(
-        c for c in text
+def normalize_text(value):
+    value = clean_text(value)
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(
+        c for c in value
         if not unicodedata.combining(c)
     )
 
-    return text.lower()
+    return value.lower().strip()
 
 
-def tokenize(text):
-    text = normalize_text(text)
+def truncate(text, length):
+    text = clean_text(text)
 
-    return [
-        x
-        for x in re.split(
-            r"[^a-z0-9]+",
-            text
-        )
-        if x
-    ]
+    if len(text) <= length:
+        return text
 
-
-def unique_by_key(items, key_func):
-    output = []
-    seen = set()
-
-    for item in items:
-        try:
-            key = key_func(item)
-        except Exception:
-            continue
-
-        if not key:
-            continue
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        output.append(item)
-
-    return output
+    return text[: length - 3] + "..."
 
 
 def now_utc():
     return datetime.now(timezone.utc)
 
 
-def parse_datetime(value):
+def parse_iso(value):
     if not value:
         return None
 
     try:
-        value = value.replace(
-            "Z",
-            "+00:00"
-        )
+        value = str(value)
+
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
 
         dt = datetime.fromisoformat(value)
 
         if dt.tzinfo is None:
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
+            dt = dt.replace(tzinfo=timezone.utc)
 
         return dt
 
@@ -313,26 +187,18 @@ def parse_datetime(value):
         return None
 
 
-def format_datetime(value):
-    dt = parse_datetime(value)
-
+def discord_timestamp(dt):
     if not dt:
         return "Không rõ"
 
-    return dt.astimezone().strftime(
-        "%d/%m/%Y %H:%M"
-    )
+    return f"<t:{int(dt.timestamp())}:F>"
 
 
-def countdown_text(value):
-    dt = parse_datetime(value)
-
+def countdown(dt):
     if not dt:
         return "Không rõ"
 
-    seconds = int(
-        (dt - now_utc()).total_seconds()
-    )
+    seconds = int((dt - now_utc()).total_seconds())
 
     if seconds <= 0:
         return "Đã bắt đầu"
@@ -345,1522 +211,2214 @@ def countdown_text(value):
 
     minutes = seconds // 60
 
-    parts = []
+    result = []
 
     if days:
-        parts.append(f"{days} ngày")
+        result.append(f"{days} ngày")
 
     if hours:
-        parts.append(f"{hours} giờ")
+        result.append(f"{hours} giờ")
 
     if minutes:
-        parts.append(f"{minutes} phút")
+        result.append(f"{minutes} phút")
 
-    if not parts:
-        return "Sắp bắt đầu"
-
-    return " ".join(parts[:3])
+    return " ".join(result) or "dưới 1 phút"
 
 
-def usd_to_prices(usd):
-    try:
-        usd = float(usd)
+def normalize_channel_name(name):
+    """
+    Ví dụ:
 
-        return (
-            round(usd * USD_TO_KRW),
-            round(usd * USD_TO_VND)
+    🎁・thong-bao-game
+    thong-bao-game
+    🎮・tim-game
+
+    đều được nhận diện.
+    """
+
+    name = name.strip()
+
+    if "・" in name:
+        name = name.split("・", 1)[1]
+
+    name = name.lower()
+    name = name.replace("_", "-")
+    name = re.sub(r"\s+", "-", name)
+
+    return name.strip("-")
+
+
+def find_notification_channel(guild):
+    wanted = normalize_channel_name(NOTIFICATION_CHANNEL_NAME)
+
+    for channel in guild.text_channels:
+        if normalize_channel_name(channel.name) == wanted:
+            return channel
+
+    return None
+
+
+def find_search_channel(guild):
+    wanted = normalize_channel_name(SEARCH_CHANNEL_NAME)
+
+    for channel in guild.text_channels:
+        if normalize_channel_name(channel.name) == wanted:
+            return channel
+
+    return None
+
+
+def get_all_guilds_channels():
+    notification_channels = []
+    search_channels = []
+
+    for guild in bot.guilds:
+        notification = find_notification_channel(guild)
+        search = find_search_channel(guild)
+
+        if notification:
+            notification_channels.append(notification)
+
+        if search:
+            search_channels.append(search)
+
+    return notification_channels, search_channels
+
+
+def safe_url(url):
+    if not url:
+        return None
+
+    if not url.startswith(("http://", "https://")):
+        return None
+
+    return url
+
+
+# =========================================================
+# HTTP
+# =========================================================
+
+async def get_session():
+    global http_session
+
+    if http_session is None or http_session.closed:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+        }
+
+        http_session = aiohttp.ClientSession(
+            timeout=REQUEST_TIMEOUT,
+            headers=headers,
         )
 
-    except Exception:
-        return 0, 0
+    return http_session
 
 
-def format_krw(value):
-    if value is None:
-        return "Không có giá"
+async def http_json(
+    url,
+    method="GET",
+    params=None,
+    json_data=None,
+    headers=None,
+):
+    session = await get_session()
 
     try:
-        value = float(value)
+        request_headers = {}
 
-        # Steam price_overview.final thường là đơn vị nhỏ
-        if value > 100000:
-            value = value / 100
+        if headers:
+            request_headers.update(headers)
 
-        return f"₩{int(value):,}"
+        async with session.request(
+            method,
+            url,
+            params=params,
+            json=json_data,
+            headers=request_headers,
+        ) as response:
 
-    except Exception:
-        return "Không có giá"
+            if response.status != 200:
+                print(
+                    "HTTP ERROR:",
+                    response.status,
+                    url,
+                )
+                return None
+
+            return await response.json(
+                content_type=None
+            )
+
+    except Exception as e:
+        print("HTTP JSON ERROR:", url, e)
+        return None
 
 
-def format_vnd(value):
-    if value is None:
-        return "Không có giá"
+async def http_text(
+    url,
+    method="GET",
+    params=None,
+):
+    session = await get_session()
 
     try:
-        value = float(value)
+        async with session.request(
+            method,
+            url,
+            params=params,
+        ) as response:
 
-        # Không chia nếu API đã trả VNĐ trực tiếp
-        if value > 10000000:
-            value = value / 100
+            if response.status != 200:
+                print(
+                    "HTTP TEXT ERROR:",
+                    response.status,
+                    url,
+                )
+                return None
 
-        return f"{int(value):,}₫"
+            return await response.text()
 
-    except Exception:
-        return "Không có giá"
-
-
-# =========================================================
-# SEARCH ALIASES
-# =========================================================
-
-def get_search_queries(query):
-    """
-    Một số game có tên mà người dùng thường gõ khác
-    tên chính thức của store.
-
-    Ví dụ:
-    gta 5 -> gta 5 / gta v / grand theft auto v
-    fifa  -> fifa / ea sports fc
-    """
-    original = clean_text(query)
-
-    normalized = normalize_text(original)
-
-    queries = [original]
-
-    if normalized in (
-        "gta",
-        "gta 5",
-        "gta5"
-    ):
-        queries.extend([
-            "GTA",
-            "GTA V",
-            "Grand Theft Auto",
-            "Grand Theft Auto V"
-        ])
-
-    elif normalized in (
-        "fifa",
-        "ea fc",
-        "fc"
-    ):
-        queries.extend([
-            "FIFA",
-            "EA SPORTS FC",
-            "EA FC"
-        ])
-
-    elif normalized in (
-        "hitman",
-        "hit man"
-    ):
-        queries.extend([
-            "HITMAN",
-            "HITMAN 2",
-            "HITMAN 3",
-            "Hitman World of Assassination"
-        ])
-
-    elif normalized in (
-        "cod",
-        "call of duty"
-    ):
-        queries.extend([
-            "Call of Duty"
-        ])
-
-    elif normalized in (
-        "spiderman",
-        "spider man"
-    ):
-        queries.extend([
-            "Marvel's Spider-Man",
-            "Spider-Man"
-        ])
-
-    # Loại trùng
-    output = []
-    seen = set()
-
-    for item in queries:
-        key = normalize_text(item)
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        output.append(item)
-
-    return output
+    except Exception as e:
+        print("HTTP TEXT ERROR:", url, e)
+        return None
 
 
 # =========================================================
-# SEARCH SCORE
+# EPIC GRAPHQL
 # =========================================================
 
-BAD_TITLE_WORDS = [
-    "soundtrack",
-    "ost",
-    "wallpaper",
-    "avatar",
-    "artbook",
-    "guide",
-    "tutorial",
-    "demo",
-    "playtest"
-]
+EPIC_SEARCH_QUERY = r"""
+query searchStoreQuery(
+    $allowCountries: String
+    $category: String
+    $comingSoon: Boolean
+    $count: Int
+    $country: String!
+    $keywords: String
+    $locale: String
+    $namespace: String
+    $itemNs: String
+    $sortBy: String
+    $sortDir: String
+    $start: Int
+    $tag: String
+    $releaseDate: String
+    $withPrice: Boolean
+    $withPromotions: Boolean
+    $priceRange: String
+    $freeGame: Boolean
+    $onSale: Boolean
+    $effectiveDate: String
+) {
+    Catalog {
+        searchStore(
+            allowCountries: $allowCountries
+            category: $category
+            comingSoon: $comingSoon
+            count: $count
+            country: $country
+            keywords: $keywords
+            locale: $locale
+            namespace: $namespace
+            itemNs: $itemNs
+            sortBy: $sortBy
+            sortDir: $sortDir
+            releaseDate: $releaseDate
+            start: $start
+            tag: $tag
+            priceRange: $priceRange
+            freeGame: $freeGame
+            onSale: $onSale
+            effectiveDate: $effectiveDate
+        ) {
+            elements {
+                id
+                namespace
+                title
+                description
+                productSlug
+                urlSlug
 
-
-def score_game_title(
-    title,
-    query
-):
-    title_n = normalize_text(title)
-    query_n = normalize_text(query)
-
-    if not title_n:
-        return -999999
-
-    if not query_n:
-        return 0
-
-    score = 0
-
-    title_tokens = tokenize(title_n)
-    query_tokens = tokenize(query_n)
-
-    # Tên chính xác
-    if title_n == query_n:
-        score += 10000
-
-    # Bắt đầu bằng query
-    if title_n.startswith(query_n):
-        score += 5000
-
-    # Chứa nguyên query
-    if query_n in title_n:
-        score += 3500
-
-    # Từng từ của query
-    for token in query_tokens:
-
-        if token in title_tokens:
-            score += 1200
-
-        elif token in title_n:
-            score += 500
-
-        else:
-            score -= 300
-
-    # Game title ngắn thường gần kết quả hơn
-    if len(title_tokens) <= len(query_tokens) + 3:
-        score += 300
-
-    # Bản game / edition / bundle vẫn giữ,
-    # nhưng DLC linh tinh bị giảm điểm
-    for word in BAD_TITLE_WORDS:
-        if word in title_n:
-            score -= 5000
-
-    if "dlc" in title_n:
-        score -= 1800
-
-    if "season pass" in title_n:
-        score -= 1800
-
-    # Edition / Bundle vẫn là kết quả hợp lệ
-    if "edition" in title_n:
-        score += 150
-
-    if "bundle" in title_n:
-        score += 100
-
-    if "complete" in title_n:
-        score += 100
-
-    if "deluxe" in title_n:
-        score += 100
-
-    if "gold" in title_n:
-        score += 100
-
-    if "ultimate" in title_n:
-        score += 100
-
-    return score
-
-
-# =========================================================
-# EPIC
-# =========================================================
-
-EPIC_GRAPHQL_URL = (
-    "https://store.epicgames.com/graphql"
-)
-
-EPIC_FREE_URL = (
-    "https://store-site-backend-static.ak.epicgames.com/"
-    "freeGamesPromotions"
-)
-
-
-async def search_epic_once(
-    session,
-    query
-):
-    """
-    Epic searchStore.
-
-    Lấy nhiều kết quả thay vì chỉ lấy 1.
-    """
-
-    graphql = """
-    query searchStoreQuery(
-        $keywords: String!
-        $country: String!
-        $locale: String
-        $start: Int
-        $count: Int
-        $category: String
-    ) {
-        Catalog {
-            searchStore(
-                keywords: $keywords
-                country: $country
-                locale: $locale
-                start: $start
-                count: $count
-                category: $category
-            ) {
-                paging {
-                    total
-                    count
+                keyImages {
+                    type
+                    url
                 }
-                elements {
-                    id
-                    namespace
-                    title
-                    productSlug
-                    urlSlug
-                    keyImages {
-                        type
-                        url
+
+                categories {
+                    path
+                }
+
+                seller {
+                    name
+                }
+
+                developerDisplayName
+                publisherDisplayName
+
+                price(country: "KR") {
+                    totalPrice {
+                        originalPrice
+                        discountPrice
+                        currencyCode
                     }
-                    price(country: $country) {
-                        totalPrice {
-                            originalPrice
-                            discountPrice
-                            fmtPrice(locale: $locale) {
-                                originalPrice
-                                discountPrice
+                }
+
+                price(country: "VN") {
+                    totalPrice {
+                        originalPrice
+                        discountPrice
+                        currencyCode
+                    }
+                }
+
+                promotions {
+                    promotionalOffers {
+                        promotionalOffers {
+                            startDate
+                            endDate
+                            discountSetting {
+                                discountType
+                                discountPercentage
+                            }
+                        }
+                    }
+
+                    upcomingPromotionalOffers {
+                        promotionalOffers {
+                            startDate
+                            endDate
+                            discountSetting {
+                                discountType
+                                discountPercentage
                             }
                         }
                     }
                 }
             }
+
+            paging {
+                count
+                total
+            }
         }
     }
-    """
+}
+"""
 
+
+EPIC_CATEGORIES = (
+    "games/edition/base"
+    "|bundles/games"
+    "|games/edition"
+    "|games/experience"
+    "|games/demo"
+)
+
+
+def epic_aliases(query):
+    q = normalize_text(query)
+
+    aliases = [query]
+
+    if q in ("gta", "grand theft auto"):
+        aliases += [
+            "GTA",
+            "Grand Theft Auto",
+            "Grand Theft Auto V",
+            "GTA V",
+            "Grand Theft Auto Online",
+        ]
+
+    elif q in ("hitman", "hitman 2", "hitman 3"):
+        aliases += [
+            "HITMAN",
+            "HITMAN 2",
+            "HITMAN 3",
+            "Hitman World of Assassination",
+            "World of Assassination",
+        ]
+
+    elif q in (
+        "fifa",
+        "ea fc",
+        "ea sports fc",
+        "fc",
+    ):
+        aliases += [
+            "FIFA",
+            "EA SPORTS FC",
+            "EA FC",
+        ]
+
+    elif q in ("cod", "call of duty"):
+        aliases += [
+            "Call of Duty",
+            "Modern Warfare",
+            "Black Ops",
+            "Warzone",
+        ]
+
+    elif q in ("minecraft",):
+        aliases += [
+            "Minecraft",
+            "Minecraft Dungeons",
+            "Minecraft Legends",
+        ]
+
+    elif q in ("red dead", "rdr"):
+        aliases += [
+            "Red Dead Redemption",
+            "Red Dead Redemption 2",
+        ]
+
+    # bỏ duplicate
+    result = []
+
+    for item in aliases:
+        if item and normalize_text(item) not in [
+            normalize_text(x) for x in result
+        ]:
+            result.append(item)
+
+    return result
+
+
+async def epic_graphql_search(keyword):
     variables = {
-        "keywords": query,
+        "allowCountries": "KR",
+        "category": EPIC_CATEGORIES,
+        "comingSoon": False,
+        "count": 40,
         "country": "KR",
+        "keywords": keyword,
         "locale": "en-US",
         "start": 0,
-        "count": 40,
-        "category": (
-            "games/edition/base|"
-            "games/edition|"
-            "bundles/games|"
-            "games/experience|"
-            "games/demo"
-        )
+        "sortBy": "releaseDate",
+        "sortDir": "DESC",
+        "withPrice": True,
+        "withPromotions": True,
     }
 
     payload = {
-        "query": graphql,
-        "variables": variables
+        "operationName": "searchStoreQuery",
+        "variables": variables,
+        "query": EPIC_SEARCH_QUERY,
     }
 
-    result = await post_json(
-        session,
-        EPIC_GRAPHQL_URL,
-        payload
-    )
+    for endpoint in EPIC_GRAPHQL_URLS:
 
-    if not result:
-        return []
-
-    try:
-        elements = (
-            result
-            ["data"]
-            ["Catalog"]
-            ["searchStore"]
-            ["elements"]
+        data = await http_json(
+            endpoint,
+            method="POST",
+            json_data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://store.epicgames.com",
+                "Referer": "https://store.epicgames.com/",
+            },
         )
 
-    except Exception as e:
-        print(
-            "❌ Epic search parse error:",
-            e
-        )
-        return []
-
-    results = []
-
-    for game in elements:
-
-        title = clean_text(
-            game.get("title")
-        )
-
-        if not title:
+        if not data:
             continue
 
-        slug = (
-            game.get("productSlug")
-            or game.get("urlSlug")
-        )
-
-        if not slug:
+        if "errors" in data:
+            print(
+                "EPIC GRAPHQL ERROR:",
+                data["errors"],
+            )
             continue
-
-        slug = slug.split("/")[0]
-
-        url = (
-            f"https://store.epicgames.com/p/{slug}"
-        )
-
-        image = None
-
-        for image_data in (
-            game.get("keyImages") or []
-        ):
-            image_type = image_data.get("type")
-
-            if image_type in (
-                "OfferImageWide",
-                "DieselStoreFrontWide",
-                "Thumbnail"
-            ):
-                image = image_data.get("url")
-                break
-
-        if not image:
-            for image_data in (
-                game.get("keyImages") or []
-            ):
-                image = image_data.get("url")
-
-                if image:
-                    break
-
-        original_krw = None
-        original_vnd = None
 
         try:
-            total_price = (
-                game
-                .get("price", {})
-                .get("totalPrice", {})
+            elements = (
+                data
+                .get("data", {})
+                .get("Catalog", {})
+                .get("searchStore", {})
+                .get("elements", [])
             )
 
-            original_price = (
-                total_price.get(
-                    "originalPrice"
-                )
-            )
+            if elements:
+                return elements
 
-            if original_price is not None:
+        except Exception as e:
+            print("EPIC PARSE ERROR:", e)
 
-                # Epic thường trả giá theo đơn vị nhỏ
-                if original_price > 100000:
-                    original_krw = (
-                        original_price / 100
-                    )
-                else:
-                    original_krw = (
-                        original_price
-                    )
-
-        except Exception:
-            pass
-
-        score = score_game_title(
-            title,
-            query
-        )
-
-        results.append({
-            "id": (
-                game.get("id")
-                or game.get("namespace")
-                or slug
-            ),
-            "title": title,
-            "url": url,
-            "image": image,
-            "original_krw": original_krw,
-            "original_vnd": original_vnd,
-            "score": score
-        })
-
-    return results
+    return []
 
 
-async def search_epic(
-    session,
-    query
-):
-    """
-    Tìm nhiều biến thể từ khóa rồi gom lại.
-    """
+def epic_image(element):
+    images = element.get("keyImages") or []
 
-    queries = get_search_queries(query)
-
-    tasks_list = [
-        search_epic_once(
-            session,
-            item
-        )
-        for item in queries
+    preferred = [
+        "DieselStoreFrontWide",
+        "OfferImageWide",
+        "ProductBanner",
+        "DieselStoreFrontTall",
+        "Thumbnail",
     ]
 
-    responses = await asyncio.gather(
-        *tasks_list,
-        return_exceptions=True
+    for image_type in preferred:
+        for image in images:
+            if image.get("type") == image_type:
+                if image.get("url"):
+                    return image["url"]
+
+    for image in images:
+        if image.get("url"):
+            return image["url"]
+
+    return None
+
+
+def epic_slug(element):
+    slug = (
+        element.get("productSlug")
+        or element.get("urlSlug")
+        or ""
     )
 
-    combined = []
+    slug = slug.strip("/")
 
-    for response in responses:
-        if isinstance(
-            response,
-            list
+    if slug.endswith("/home"):
+        slug = slug[:-5]
+
+    if slug.endswith("-home"):
+        slug = slug[:-5]
+
+    return slug
+
+
+def epic_link(element):
+    slug = epic_slug(element)
+
+    if not slug:
+        return "https://store.epicgames.com/"
+
+    return (
+        "https://store.epicgames.com/"
+        f"en-US/p/{slug}"
+    )
+
+
+def epic_price(element, country):
+    prices = element.get("price")
+
+    # GraphQL có thể trả object hoặc list
+    if isinstance(prices, list):
+        price_data = None
+
+        for item in prices:
+            if item:
+                price_data = item
+                break
+    else:
+        price_data = prices
+
+    if not price_data:
+        return None
+
+    total = price_data.get("totalPrice")
+
+    if not total:
+        return None
+
+    original = total.get("originalPrice")
+    discount = total.get("discountPrice")
+    currency = total.get("currencyCode")
+
+    if discount is None:
+        discount = original
+
+    if original is None and discount is None:
+        return None
+
+    if country == "KR":
+        currency = currency or "KRW"
+    else:
+        currency = currency or "VND"
+
+    return {
+        "original": original,
+        "discount": discount,
+        "currency": currency,
+    }
+
+
+def parse_epic_element(element):
+    title = clean_text(
+        element.get("title")
+        or ""
+    )
+
+    if not title:
+        return None
+
+    categories = []
+
+    for category in (
+        element.get("categories") or []
+    ):
+        path = category.get("path")
+
+        if path:
+            categories.append(path)
+
+    return {
+        "store": "Epic",
+        "id": str(element.get("id") or ""),
+        "namespace": str(
+            element.get("namespace") or ""
+        ),
+        "title": title,
+        "description": clean_text(
+            element.get("description")
+            or ""
+        ),
+        "image": epic_image(element),
+        "url": epic_link(element),
+        "price_kr": epic_price(
+            element,
+            "KR",
+        ),
+        "price_vn": epic_price(
+            element,
+            "VN",
+        ),
+        "categories": categories,
+        "developer": clean_text(
+            element.get(
+                "developerDisplayName"
+            )
+            or ""
+        ),
+        "publisher": clean_text(
+            element.get(
+                "publisherDisplayName"
+            )
+            or ""
+        ),
+    }
+
+
+def epic_match_score(game, query):
+    q = normalize_text(query)
+    title = normalize_text(
+        game.get("title", "")
+    )
+
+    if not title:
+        return 0
+
+    score = 0
+
+    if title == q:
+        score += 1000
+
+    if q in title:
+        score += 500
+
+    words = q.split()
+
+    for word in words:
+        if word and word in title:
+            score += 100
+
+    # Tăng điểm cho các series nổi tiếng
+    if q == "gta" and (
+        "grand theft auto" in title
+        or title.startswith("gta")
+    ):
+        score += 500
+
+    if q == "hitman" and (
+        "hitman" in title
+        or "world of assassination" in title
+    ):
+        score += 500
+
+    if q == "fifa" and (
+        "fifa" in title
+        or "ea sports fc" in title
+        or "ea fc" in title
+    ):
+        score += 500
+
+    return score
+
+
+async def epic_search(query):
+    cache_key = normalize_text(query)
+
+    cached = epic_search_cache.get(
+        cache_key
+    )
+
+    if cached:
+        saved_time, saved_data = cached
+
+        if (
+            (now_utc().timestamp() - saved_time)
+            < CACHE_SECONDS
         ):
-            combined.extend(response)
+            return saved_data
 
-    combined = unique_by_key(
-        combined,
-        lambda x: x.get("id")
-    )
+    all_results = {}
 
-    # Chấm điểm lại theo từ khóa gốc
-    for item in combined:
-        item["score"] = score_game_title(
-            item.get("title", ""),
-            query
+    for keyword in epic_aliases(query):
+
+        elements = await epic_graphql_search(
+            keyword
         )
 
-    # Không vứt edition/bundle.
-    # Chỉ đẩy DLC/demo linh tinh xuống dưới.
-    combined.sort(
+        for element in elements:
+
+            game = parse_epic_element(
+                element
+            )
+
+            if not game:
+                continue
+
+            game_id = (
+                game["id"]
+                or game["namespace"]
+                or game["title"]
+            )
+
+            if game_id not in all_results:
+                all_results[game_id] = game
+
+    results = list(all_results.values())
+
+    for game in results:
+        game["_score"] = epic_match_score(
+            game,
+            query,
+        )
+
+    results.sort(
         key=lambda x: (
-            x.get("score", -999999),
+            x.get("_score", 0),
             normalize_text(
                 x.get("title", "")
-            )
+            ),
         ),
-        reverse=True
+        reverse=True,
     )
 
-    return combined[:25]
+    # chỉ lấy những kết quả thực sự liên quan
+    filtered = [
+        game
+        for game in results
+        if game.get("_score", 0) > 0
+    ]
+
+    epic_search_cache[cache_key] = (
+        now_utc().timestamp(),
+        filtered,
+    )
+
+    return filtered
 
 
 # =========================================================
 # EPIC FREE GAMES
 # =========================================================
 
-async def get_epic_free_games(
-    session
-):
-    result = await get_json(
-        session,
-        EPIC_FREE_URL
-    )
-
-    if not result:
-        return []
+def extract_epic_promotions(data):
+    results = []
 
     try:
         elements = (
-            result
-            ["data"]
-            ["Catalog"]
-            ["searchStore"]
-            ["elements"]
+            data
+            .get("data", {})
+            .get("Catalog", {})
+            .get("searchStore", {})
+            .get("elements", [])
         )
 
-    except Exception as e:
-        print(
-            "❌ Epic free parse error:",
-            e
-        )
+        if elements:
+            for element in elements:
+                game = parse_epic_element(
+                    element
+                )
+
+                if game:
+                    results.append(game)
+
+            return results
+
+    except Exception:
+        pass
+
+    return results
+
+
+async def get_epic_free_games():
+    data = await http_json(
+        EPIC_FREE_URL
+    )
+
+    if not data:
         return []
 
-    games = []
+    results = []
 
-    for game in elements:
+    try:
+        elements = (
+            data
+            .get("data", {})
+            .get("Catalog", {})
+            .get("searchStore", {})
+            .get("elements", [])
+        )
 
-        try:
+        for element in elements:
+
             title = clean_text(
-                game.get("title")
+                element.get("title")
+                or element.get("name")
+                or ""
             )
 
             if not title:
                 continue
 
             promotions = (
-                game.get("promotions")
+                element.get(
+                    "promotions"
+                )
                 or {}
             )
 
-            promotional_offers = (
-                promotions
-                .get("promotionalOffers")
+            current_promotions = (
+                promotions.get(
+                    "promotionalOffers"
+                )
                 or []
             )
 
-            upcoming_offers = (
-                promotions
-                .get("upcomingPromotionalOffers")
+            upcoming_promotions = (
+                promotions.get(
+                    "upcomingPromotionalOffers"
+                )
                 or []
             )
 
-            slug = (
-                game.get("productSlug")
-                or game.get("urlSlug")
-            )
+            active = None
+            upcoming = None
 
-            if not slug:
+            for block in current_promotions:
+                for offer in (
+                    block.get(
+                        "promotionalOffers"
+                    )
+                    or []
+                ):
+                    discount = (
+                        offer
+                        .get("discountSetting")
+                        or {}
+                    )
+
+                    percentage = (
+                        discount
+                        .get(
+                            "discountPercentage"
+                        )
+                    )
+
+                    if percentage == 0:
+                        active = offer
+
+            if not active:
+                for block in upcoming_promotions:
+                    for offer in (
+                        block.get(
+                            "promotionalOffers"
+                        )
+                        or []
+                    ):
+                        discount = (
+                            offer
+                            .get(
+                                "discountSetting"
+                            )
+                            or {}
+                        )
+
+                        percentage = (
+                            discount
+                            .get(
+                                "discountPercentage"
+                            )
+                        )
+
+                        if percentage == 0:
+                            upcoming = offer
+
+            if not active and not upcoming:
                 continue
 
-            slug = slug.split("/")[0]
-
-            url = (
-                f"https://store.epicgames.com/p/{slug}"
+            images = (
+                element.get(
+                    "keyImages"
+                )
+                or []
             )
 
             image = None
 
-            for img in (
-                game.get("keyImages") or []
-            ):
-                if img.get("type") in (
-                    "OfferImageWide",
-                    "DieselStoreFrontWide"
-                ):
-                    image = img.get("url")
+            for preferred in [
+                "DieselStoreFrontWide",
+                "OfferImageWide",
+                "ProductBanner",
+                "Thumbnail",
+            ]:
+                for item in images:
+                    if (
+                        item.get("type")
+                        == preferred
+                    ):
+                        image = item.get(
+                            "url"
+                        )
+                        break
+
+                if image:
                     break
 
             if not image:
-                for img in (
-                    game.get("keyImages") or []
-                ):
-                    image = img.get("url")
-
-                    if image:
+                for item in images:
+                    if item.get("url"):
+                        image = item.get(
+                            "url"
+                        )
                         break
 
-            # ---------------------------------------------
-            # ĐANG FREE
-            # ---------------------------------------------
-
-            for offer_group in promotional_offers:
-
-                for offer in (
-                    offer_group.get(
-                        "promotionalOffers"
-                    )
-                    or []
-                ):
-
-                    discount_setting = (
-                        offer.get(
-                            "discountSetting"
-                        )
-                        or {}
-                    )
-
-                    if (
-                        discount_setting
-                        .get("discountPercentage")
-                        != 0
-                    ):
-                        continue
-
-                    games.append({
-                        "id": (
-                            game.get("id")
-                            or slug
-                        ),
-                        "title": title,
-                        "url": url,
-                        "image": image,
-                        "start_date": (
-                            offer.get(
-                                "startDate"
-                            )
-                        ),
-                        "end_date": (
-                            offer.get(
-                                "endDate"
-                            )
-                        ),
-                        "original_krw": 0,
-                        "original_vnd": 0,
-                        "active": True
-                    })
-
-            # ---------------------------------------------
-            # SẮP FREE
-            # ---------------------------------------------
-
-            for offer_group in upcoming_offers:
-
-                for offer in (
-                    offer_group.get(
-                        "promotionalOffers"
-                    )
-                    or []
-                ):
-
-                    discount_setting = (
-                        offer.get(
-                            "discountSetting"
-                        )
-                        or {}
-                    )
-
-                    if (
-                        discount_setting
-                        .get("discountPercentage")
-                        != 0
-                    ):
-                        continue
-
-                    games.append({
-                        "id": (
-                            game.get("id")
-                            or slug
-                        ),
-                        "title": title,
-                        "url": url,
-                        "image": image,
-                        "start_date": (
-                            offer.get(
-                                "startDate"
-                            )
-                        ),
-                        "end_date": (
-                            offer.get(
-                                "endDate"
-                            )
-                        ),
-                        "original_krw": 0,
-                        "original_vnd": 0,
-                        "active": False
-                    })
-
-        except Exception:
-            continue
-
-    # Loại trùng
-    games = unique_by_key(
-        games,
-        lambda x: (
-            str(x.get("id"))
-            + "|"
-            + str(x.get("start_date"))
-            + "|"
-            + str(x.get("end_date"))
-        )
-    )
-
-    return games
-
-
-# =========================================================
-# STEAM SEARCH API
-# =========================================================
-
-STEAM_SEARCH_API = (
-    "https://store.steampowered.com/api/storesearch"
-)
-
-STEAM_APPDETAILS_API = (
-    "https://store.steampowered.com/api/appdetails"
-)
-
-
-async def steam_search_once(
-    session,
-    query
-):
-    params = {
-        "term": query,
-        "l": "english",
-        "cc": "KR",
-        "category1": "998"
-    }
-
-    data_json = await get_json(
-        session,
-        STEAM_SEARCH_API,
-        params=params,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 "
-                "Version/18.0 Mobile/15E148 Safari/604.1"
-            )
-        }
-    )
-
-    if not data_json:
-        return []
-
-    items = (
-        data_json.get("items")
-        or []
-    )
-
-    results = []
-
-    for item in items:
-
-        # Chỉ lấy app/game
-        item_type = (
-            item.get("type")
-            or "app"
-        )
-
-        if item_type != "app":
-            continue
-
-        appid = (
-            item.get("id")
-            or item.get("appid")
-        )
-
-        title = clean_text(
-            item.get("name")
-        )
-
-        if not appid or not title:
-            continue
-
-        url = (
-            f"https://store.steampowered.com/app/"
-            f"{appid}/"
-        )
-
-        image = (
-            item.get("tiny_image")
-            or item.get("header_image")
-        )
-
-        score = score_game_title(
-            title,
-            query
-        )
-
-        # Giá Steam search
-        price_data = (
-            item.get("price")
-            or {}
-        )
-
-        results.append({
-            "appid": str(appid),
-            "title": title,
-            "url": url,
-            "image": image,
-            "score": score,
-            "krw": (
-                price_data.get("final")
-                if isinstance(
-                    price_data,
-                    dict
+            slug = (
+                element.get(
+                    "productSlug"
                 )
-                else None
-            ),
-            "vnd": None
-        })
+                or element.get(
+                    "urlSlug"
+                )
+                or ""
+            )
+
+            slug = str(slug).strip("/")
+
+            if slug.endswith("/home"):
+                slug = slug[:-5]
+
+            url = (
+                "https://store.epicgames.com/"
+                f"en-US/p/{slug}"
+            )
+
+            start_date = None
+            end_date = None
+
+            selected = active or upcoming
+
+            if selected:
+                start_date = parse_iso(
+                    selected.get(
+                        "startDate"
+                    )
+                )
+
+                end_date = parse_iso(
+                    selected.get(
+                        "endDate"
+                    )
+                )
+
+            results.append(
+                {
+                    "store": "Epic",
+                    "id": str(
+                        element.get(
+                            "id"
+                        )
+                        or element.get(
+                            "namespace"
+                        )
+                        or title
+                    ),
+                    "title": title,
+                    "description": clean_text(
+                        element.get(
+                            "description"
+                        )
+                        or ""
+                    ),
+                    "image": image,
+                    "url": url,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "is_active": bool(active),
+                    "is_upcoming": bool(
+                        upcoming
+                    ),
+                    "price_kr": None,
+                    "price_vn": None,
+                }
+            )
+
+    except Exception as e:
+        print(
+            "EPIC FREE PARSE ERROR:",
+            e,
+        )
 
     return results
 
 
-async def get_steam_app_details(
-    session,
-    appid,
-    country
+# =========================================================
+# STEAM SEARCH
+# =========================================================
+
+async def steam_store_search(
+    query,
+    cc="kr",
+    limit=50,
 ):
+    cache_key = (
+        f"{normalize_text(query)}:"
+        f"{cc}:{limit}"
+    )
+
+    cached = steam_search_cache.get(
+        cache_key
+    )
+
+    if cached:
+        saved_time, saved_data = cached
+
+        if (
+            now_utc().timestamp()
+            - saved_time
+            < CACHE_SECONDS
+        ):
+            return saved_data
+
     params = {
-        "appids": str(appid),
-        "cc": country,
-        "l": "english"
+        "term": query,
+        "l": "english",
+        "cc": cc.upper(),
+        "start": 0,
+        "count": limit,
+        "infinite": 1,
     }
 
-    result = await get_json(
-        session,
-        STEAM_APPDETAILS_API,
-        params=params
-    )
-
-    if not result:
-        return None
-
-    try:
-        item = result.get(
-            str(appid)
-        )
-
-        if not item:
-            return None
-
-        if not item.get("success"):
-            return None
-
-        return item.get("data")
-
-    except Exception:
-        return None
-
-
-async def get_steam_prices(
-    session,
-    appid
-):
-    """
-    Lấy KRW + VNĐ song song.
-    """
-
-    kr_task = get_steam_app_details(
-        session,
-        appid,
-        "KR"
-    )
-
-    vn_task = get_steam_app_details(
-        session,
-        appid,
-        "VN"
-    )
-
-    kr_data, vn_data = await asyncio.gather(
-        kr_task,
-        vn_task,
-        return_exceptions=True
-    )
-
-    if isinstance(
-        kr_data,
-        Exception
-    ):
-        kr_data = None
-
-    if isinstance(
-        vn_data,
-        Exception
-    ):
-        vn_data = None
-
-    return kr_data, vn_data
-
-
-async def search_steam(
-    session,
-    query
-):
-    """
-    Tìm nhiều từ khóa rồi gom tất cả kết quả.
-    """
-
-    queries = get_search_queries(query)
-
-    tasks_list = [
-        steam_search_once(
-            session,
-            item
-        )
-        for item in queries
-    ]
-
-    responses = await asyncio.gather(
-        *tasks_list,
-        return_exceptions=True
-    )
-
-    combined = []
-
-    for response in responses:
-        if isinstance(
-            response,
-            list
-        ):
-            combined.extend(response)
-
-    # Loại app trùng
-    combined = unique_by_key(
-        combined,
-        lambda x: x.get("appid")
-    )
-
-    # Chấm lại theo query gốc
-    for item in combined:
-        item["score"] = score_game_title(
-            item.get("title", ""),
-            query
-        )
-
-    # Sắp xếp theo độ khớp
-    combined.sort(
-        key=lambda x: (
-            x.get("score", -999999),
-            normalize_text(
-                x.get("title", "")
-            )
-        ),
-        reverse=True
-    )
-
-    # Lấy nhiều kết quả.
-    # Không chỉ 5 game.
-    candidates = combined[:30]
-
-    # Lấy giá song song
-    price_tasks = [
-        get_steam_prices(
-            session,
-            item["appid"]
-        )
-        for item in candidates
-    ]
-
-    price_results = await asyncio.gather(
-        *price_tasks,
-        return_exceptions=True
-    )
-
-    final = []
-
-    for item, prices in zip(
-        candidates,
-        price_results
-    ):
-
-        if isinstance(
-            prices,
-            Exception
-        ):
-            prices = (
-                None,
-                None
-            )
-
-        kr_data, vn_data = prices
-
-        # ---------------------------------------------
-        # KR
-        # ---------------------------------------------
-
-        if kr_data:
-            item["image"] = (
-                kr_data.get(
-                    "header_image"
-                )
-                or item.get("image")
-            )
-
-            price = kr_data.get(
-                "price_overview"
-            )
-
-            if price:
-                item["krw"] = price.get(
-                    "final"
-                )
-
-        # ---------------------------------------------
-        # VN
-        # ---------------------------------------------
-
-        if vn_data:
-            price = vn_data.get(
-                "price_overview"
-            )
-
-            if price:
-                item["vnd"] = price.get(
-                    "final"
-                )
-
-        # Nếu API trả game nhưng không có giá
-        # vẫn giữ kết quả.
-        final.append(item)
-
-    return final
-
-
-# =========================================================
-# STEAM FREE GAMES
-# =========================================================
-
-async def get_steam_free_games(
-    session
-):
-    """
-    Tìm các game đang giảm 100%.
-
-    Không tự đoán lịch tương lai của Steam.
-    """
-
-    url = (
-        "https://store.steampowered.com/search/results/"
-        "?specials=1"
-        "&maxprice=free"
-        "&hidef2p=1"
-        "&category1=998"
-        "&count=50"
-        "&cc=KR"
-        "&l=english"
-    )
-
-    html = await get_text(
-        session,
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    rows = soup.select(
-        "a.search_result_row"
+    data = await http_json(
+        STEAM_STORESEARCH_URL,
+        params=params,
     )
 
     results = []
 
-    for row in rows:
-
-        title_el = row.select_one(
-            ".title"
+    if data:
+        items = data.get(
+            "items",
+            []
         )
 
-        if not title_el:
-            continue
+        for item in items:
 
-        title = clean_text(
-            title_el.get_text()
+            appid = item.get("id")
+
+            if not appid:
+                continue
+
+            results.append(
+                {
+                    "appid": int(appid),
+                    "name": clean_text(
+                        item.get(
+                            "name"
+                        )
+                        or ""
+                    ),
+                    "price": item.get(
+                        "price"
+                    ),
+                    "tiny_image": item.get(
+                        "tiny_image"
+                    ),
+                }
+            )
+
+    steam_search_cache[cache_key] = (
+        now_utc().timestamp(),
+        results,
+    )
+
+    return results
+
+
+async def steam_html_search(
+    query,
+    cc="kr",
+):
+    """
+    Fallback cho trường hợp storesearch
+    trả quá ít kết quả.
+    """
+
+    params = {
+        "term": query,
+        "cc": cc.upper(),
+        "l": "english",
+        "start": 0,
+        "count": 50,
+        "json": 1,
+    }
+
+    data = await http_json(
+        STEAM_SEARCH_URL,
+        params=params,
+    )
+
+    if isinstance(data, dict):
+        items = (
+            data.get("items")
+            or data.get("results")
+            or []
         )
 
-        href = row.get("href")
+        return items
 
-        if not href:
-            continue
+    return []
 
-        match = re.search(
-            r"/app/(\d+)",
-            href
+
+# =========================================================
+# STEAM DETAILS
+# =========================================================
+
+async def steam_app_details(
+    appid,
+    cc="KR",
+):
+    key = f"{appid}:{cc.upper()}"
+
+    cached = steam_detail_cache.get(
+        key
+    )
+
+    if cached:
+        saved_time, saved_data = cached
+
+        if (
+            now_utc().timestamp()
+            - saved_time
+            < CACHE_SECONDS
+        ):
+            return saved_data
+
+    async with steam_detail_semaphore:
+
+        params = {
+            "appids": str(appid),
+            "cc": cc.upper(),
+            "l": "english",
+            "filters": (
+                "basic,price_overview,"
+                "genres,categories,"
+                "screenshots,release_date"
+            ),
+        }
+
+        data = await http_json(
+            STEAM_APPDETAILS_URL,
+            params=params,
         )
 
-        if not match:
-            continue
+    if not data:
+        return None
 
-        appid = match.group(1)
+    raw = data.get(
+        str(appid)
+    )
 
-        details = await get_steam_app_details(
-            session,
-            appid,
-            "KR"
+    if not raw:
+        return None
+
+    if not raw.get("success"):
+        return None
+
+    result = raw.get("data")
+
+    if not result:
+        return None
+
+    steam_detail_cache[key] = (
+        now_utc().timestamp(),
+        result,
+    )
+
+    return result
+
+
+def steam_price_string(
+    price,
+    country,
+):
+    if not price:
+        return "FREE"
+
+    currency = (
+        price.get("currency")
+        or ""
+    )
+
+    final_formatted = (
+        price.get(
+            "final_formatted"
+        )
+        or ""
+    )
+
+    if final_formatted:
+        return final_formatted
+
+    final = price.get("final")
+
+    if final is None:
+        return "Không rõ"
+
+    # Steam trả KRW/VND không có phần thập phân
+    if currency in (
+        "KRW",
+        "VND",
+    ):
+        return (
+            f"{int(final):,} "
+            f"{currency}"
         )
 
-        if not details:
-            continue
+    try:
+        return (
+            f"{float(final) / 100:.2f} "
+            f"{currency}"
+        )
+    except Exception:
+        return str(final)
 
-        if details.get("type") != "game":
-            continue
 
-        # Game vốn free từ đầu
-        if details.get("is_free"):
-            continue
+def steam_image(data):
+    if not data:
+        return None
 
-        price = details.get(
+    return (
+        data.get("header_image")
+        or data.get("capsule_image")
+    )
+
+
+def steam_genres(data):
+    result = []
+
+    for genre in (
+        data.get("genres")
+        or []
+    ):
+        name = genre.get(
+            "description"
+        )
+
+        if name:
+            result.append(
+                clean_text(name)
+            )
+
+    return result
+
+
+def steam_categories(data):
+    result = []
+
+    for category in (
+        data.get("categories")
+        or []
+    ):
+        name = category.get(
+            "description"
+        )
+
+        if name:
+            result.append(
+                clean_text(name)
+            )
+
+    return result
+
+
+async def build_steam_game(
+    appid,
+):
+    kr = await steam_app_details(
+        appid,
+        "KR",
+    )
+
+    if not kr:
+        return None
+
+    # VN request riêng để lấy giá Việt Nam
+    vn = await steam_app_details(
+        appid,
+        "VN",
+    )
+
+    title = clean_text(
+        kr.get("name")
+        or ""
+    )
+
+    if not title:
+        return None
+
+    genres = steam_genres(
+        kr
+    )
+
+    categories = steam_categories(
+        kr
+    )
+
+    price_kr = kr.get(
+        "price_overview"
+    )
+
+    price_vn = (
+        vn.get(
             "price_overview"
         )
+        if vn
+        else None
+    )
 
-        if not price:
-            continue
+    is_free = bool(
+        kr.get("is_free")
+    )
 
-        initial = price.get(
-            "initial",
-            0
-        )
+    if not is_free:
+        if not price_kr:
+            is_free = True
 
-        final_price = price.get(
-            "final",
-            0
-        )
-
-        discount = price.get(
-            "discount_percent",
-            0
-        )
-
-        if initial <= 0:
-            continue
-
-        if final_price != 0:
-            continue
-
-        if discount != 100:
-            continue
-
-        description = clean_text(
-            details.get(
-                "short_description",
-                ""
+    return {
+        "store": "Steam",
+        "id": str(appid),
+        "appid": int(appid),
+        "title": title,
+        "description": clean_text(
+            kr.get(
+                "short_description"
             )
-        )
+            or kr.get(
+                "detailed_description"
+            )
+            or ""
+        ),
+        "image": steam_image(kr),
+        "url": (
+            "https://store.steampowered.com/"
+            f"app/{appid}/"
+        ),
+        "price_kr": price_kr,
+        "price_vn": price_vn,
+        "price_kr_text": steam_price_string(
+            price_kr,
+            "KR",
+        ),
+        "price_vn_text": steam_price_string(
+            price_vn,
+            "VN",
+        ),
+        "genres": genres,
+        "categories": categories,
+        "release_date": clean_text(
+            (
+                kr.get(
+                    "release_date"
+                )
+                or {}
+            ).get(
+                "date"
+            )
+            or ""
+        ),
+        "developer": ", ".join(
+            kr.get(
+                "developers"
+            )
+            or []
+        ),
+        "publisher": ", ".join(
+            kr.get(
+                "publishers"
+            )
+            or []
+        ),
+        "is_free": is_free,
+    }
 
-        combined = (
-            title
-            + " "
-            + description
-        ).lower()
 
-        blocked = [
-            "free weekend",
-            "free trial",
-            "weekend trial",
-            "limited trial"
+def steam_aliases(query):
+    q = normalize_text(query)
+
+    aliases = [query]
+
+    if q == "gta":
+        aliases += [
+            "Grand Theft Auto",
+            "GTA V",
+            "Grand Theft Auto V",
+            "Grand Theft Auto IV",
         ]
 
-        if any(
-            word in combined
-            for word in blocked
-        ):
-            continue
+    elif q == "hitman":
+        aliases += [
+            "HITMAN",
+            "HITMAN 2",
+            "HITMAN 3",
+            "Hitman World of Assassination",
+        ]
 
-        results.append({
-            "id": appid,
-            "title": title,
-            "url": (
-                "https://store.steampowered.com/app/"
-                f"{appid}/"
-            ),
-            "image": details.get(
-                "header_image"
-            ),
-            "original_krw": initial,
-            "original_vnd": None
-        })
+    elif q == "fifa":
+        aliases += [
+            "FIFA",
+            "EA SPORTS FC",
+            "EA FC",
+        ]
 
-    return unique_by_key(
-        results,
-        lambda x: x.get("id")
+    elif q == "cod":
+        aliases += [
+            "Call of Duty",
+            "Modern Warfare",
+            "Black Ops",
+        ]
+
+    elif q == "minecraft":
+        aliases += [
+            "Minecraft",
+            "Minecraft Dungeons",
+            "Minecraft Legends",
+        ]
+
+    return list(
+        dict.fromkeys(
+            aliases
+        )
     )
 
 
-# =========================================================
-# SEARCH EMBED
-# =========================================================
-
-def make_search_embed(
-    store,
+def steam_match_score(
+    game,
     query,
-    results
 ):
-    if store == "epic":
-        color = 0x7C3AED
-        store_name = "EPIC GAMES STORE"
-        icon = "🟣"
-    else:
-        color = 0x1B9FFF
-        store_name = "STEAM"
-        icon = "🔵"
-
-    embed = discord.Embed(
-        title=(
-            f"🎮・KẾT QUẢ: "
-            f"{query.upper()}"
-        ),
-        description=(
-            f"{icon} **{store_name}**\n"
-            f"🔎 Tìm thấy **{len(results)}** "
-            "kết quả liên quan\n"
-            "⚡ Các phiên bản / Edition / Bundle "
-            "liên quan đều được liệt kê."
-        ),
-        color=color
+    q = normalize_text(query)
+    title = normalize_text(
+        game.get("title")
+        or ""
     )
 
-    for index, game in enumerate(
-        results,
-        start=1
+    score = 0
+
+    if title == q:
+        score += 1000
+
+    if q in title:
+        score += 500
+
+    for word in q.split():
+        if word in title:
+            score += 100
+
+    if q == "gta" and (
+        "grand theft auto" in title
+        or title.startswith("gta")
     ):
-        title = game.get(
-            "title",
-            "Không tên"
+        score += 500
+
+    if q == "hitman" and (
+        "hitman" in title
+        or "world of assassination" in title
+    ):
+        score += 500
+
+    if q == "fifa" and (
+        "fifa" in title
+        or "ea sports fc" in title
+        or "ea fc" in title
+    ):
+        score += 500
+
+    return score
+
+
+async def steam_search(query):
+    cache_key = normalize_text(query)
+
+    results_by_id = {}
+
+    for keyword in steam_aliases(query):
+
+        search_results = await steam_store_search(
+            keyword,
+            "kr",
+            50,
         )
 
-        if store == "epic":
-            krw = format_krw(
-                game.get(
-                    "original_krw"
+        for item in search_results:
+
+            appid = item.get("appid")
+
+            if not appid:
+                continue
+
+            if appid not in results_by_id:
+
+                # lấy chi tiết
+                game = await build_steam_game(
+                    appid
                 )
-            )
 
-            vnd = format_vnd(
-                game.get(
-                    "original_vnd"
-                )
-            )
+                if game:
+                    results_by_id[
+                        appid
+                    ] = game
 
-        else:
-            krw = format_krw(
-                game.get("krw")
-            )
-
-            vnd = format_vnd(
-                game.get("vnd")
-            )
-
-        url = game.get(
-            "url",
-            "#"
-        )
-
-        value = (
-            f"💰 **KRW:** {krw}\n"
-            f"💵 **VNĐ:** {vnd}\n"
-            f"🔗 [Mở trang game]({url})"
-        )
-
-        embed.add_field(
-            name=f"#{index}・{title}",
-            value=value,
-            inline=False
-        )
-
-    # Discord giới hạn embed.
-    # Nếu quá dài, chỉ lấy các kết quả
-    # quan trọng nhất nhưng vẫn cố giữ nhiều edition.
-    if len(embed.fields) > 20:
-        # Discord cho phép tối đa 25 field.
-        pass
-
-    # Một ảnh lớn ở dưới
-    image = None
+    results = list(
+        results_by_id.values()
+    )
 
     for game in results:
-        if game.get("image"):
-            image = game.get("image")
-            break
-
-    if image:
-        embed.set_image(
-            url=image
+        game["_score"] = steam_match_score(
+            game,
+            query,
         )
 
-    embed.set_footer(
-        text=(
-            "🎮 Free Game Bot • "
-            f"{store_name} • "
-            f"{len(results)} kết quả"
-        )
-    )
+    results = [
+        x for x in results
+        if x.get("_score", 0) > 0
+    ]
 
-    return embed
-
-
-def make_no_result_embed(
-    store,
-    query
-):
-    if store == "epic":
-        color = 0x7C3AED
-        name = "Epic Games Store"
-        icon = "🟣"
-    else:
-        color = 0x1B9FFF
-        name = "Steam"
-        icon = "🔵"
-
-    return discord.Embed(
-        title="🔎・KHÔNG TÌM THẤY",
-        description=(
-            f"{icon} Không tìm thấy kết quả phù hợp "
-            f"với **{query}** trên **{name}**.\n\n"
-            "💡 Thử tên ngắn hơn:\n"
-            "`gta`\n"
-            "`hitman`\n"
-            "`fifa`\n"
-            "`minecraft`"
+    results.sort(
+        key=lambda x: (
+            x.get("_score", 0),
+            normalize_text(
+                x.get("title", "")
+            ),
         ),
-        color=color
+        reverse=True,
     )
 
+    steam_search_cache[
+        cache_key
+    ] = (
+        now_utc().timestamp(),
+        results,
+    )
+
+    return results
+
 
 # =========================================================
-# FREE GAME EMBED
+# GENRE SEARCH
 # =========================================================
+
+GENRES = {
+    "Kinh dị": [
+        "horror",
+        "survival horror",
+        "psychological horror",
+    ],
+    "Hành động": [
+        "action",
+    ],
+    "Phiêu lưu": [
+        "adventure",
+    ],
+    "RPG": [
+        "rpg",
+        "role-playing",
+    ],
+    "Thể thao": [
+        "sports",
+    ],
+    "Đua xe": [
+        "racing",
+    ],
+    "Chiến thuật": [
+        "strategy",
+    ],
+    "Indie": [
+        "indie",
+    ],
+    "Mô phỏng": [
+        "simulation",
+    ],
+    "Casual": [
+        "casual",
+    ],
+}
+
+
+def genre_matches(
+    game,
+    genre_name,
+):
+    targets = [
+        normalize_text(x)
+        for x in GENRES.get(
+            genre_name,
+            [],
+        )
+    ]
+
+    game_genres = [
+        normalize_text(x)
+        for x in (
+            game.get(
+                "genres"
+            )
+            or []
+        )
+    ]
+
+    game_categories = [
+        normalize_text(x)
+        for x in (
+            game.get(
+                "categories"
+            )
+            or []
+        )
+    ]
+
+    haystack = (
+        game_genres
+        + game_categories
+    )
+
+    for target in targets:
+        for value in haystack:
+
+            if (
+                target in value
+                or value in target
+            ):
+                return True
+
+    return False
+
+
+async def search_steam_genre(
+    genre_name,
+):
+    targets = GENRES.get(
+        genre_name,
+        [],
+    )
+
+    all_games = {}
+
+    for target in targets:
+
+        search_results = await steam_store_search(
+            target,
+            "kr",
+            50,
+        )
+
+        for item in search_results:
+
+            appid = item.get("appid")
+
+            if not appid:
+                continue
+
+            if appid in all_games:
+                continue
+
+            game = await build_steam_game(
+                appid
+            )
+
+            if not game:
+                continue
+
+            if genre_matches(
+                game,
+                genre_name,
+            ):
+                all_games[
+                    appid
+                ] = game
+
+    results = list(
+        all_games.values()
+    )
+
+    results.sort(
+        key=lambda x:
+        normalize_text(
+            x.get("title", "")
+        )
+    )
+
+    return results
+
+
+async def search_epic_genre(
+    genre_name,
+):
+    results_by_id = {}
+
+    keywords = GENRES.get(
+        genre_name,
+        [],
+    )
+
+    for keyword in keywords:
+
+        elements = await epic_graphql_search(
+            keyword
+        )
+
+        for element in elements:
+
+            game = parse_epic_element(
+                element
+            )
+
+            if not game:
+                continue
+
+            title = normalize_text(
+                game.get(
+                    "title",
+                    "",
+                )
+            )
+
+            description = normalize_text(
+                game.get(
+                    "description",
+                    "",
+                )
+            )
+
+            categories = [
+                normalize_text(x)
+                for x in (
+                    game.get(
+                        "categories"
+                    )
+                    or []
+                )
+            ]
+
+            targets = [
+                normalize_text(x)
+                for x in keywords
+            ]
+
+            haystack = (
+                [title, description]
+                + categories
+            )
+
+            matched = False
+
+            for target in targets:
+                for value in haystack:
+
+                    if (
+                        target in value
+                    ):
+                        matched = True
+                        break
+
+                if matched:
+                    break
+
+            if matched:
+                gid = (
+                    game.get("id")
+                    or game.get(
+                        "namespace"
+                    )
+                    or title
+                )
+
+                results_by_id[
+                    gid
+                ] = game
+
+    results = list(
+        results_by_id.values()
+    )
+
+    results.sort(
+        key=lambda x:
+        normalize_text(
+            x.get("title", "")
+        )
+    )
+
+    return results
+
+
+async def search_genre(
+    genre_name,
+):
+    steam_results, epic_results = (
+        await asyncio.gather(
+            search_steam_genre(
+                genre_name
+            ),
+            search_epic_genre(
+                genre_name
+            ),
+        )
+    )
+
+    combined = []
+
+    for game in steam_results:
+        combined.append(game)
+
+    for game in epic_results:
+        combined.append(game)
+
+    return combined
+
+
+# =========================================================
+# CURRENT FREE STEAM
+# =========================================================
+
+async def get_steam_free_games():
+    """
+    Steam không có endpoint public chính thức
+    cho "toàn bộ game free-to-keep đang active".
+
+    Dùng trang Specials của Steam làm nguồn
+    tìm các deal giá 0, sau đó kiểm tra AppDetails.
+    """
+
+    params = {
+        "specials": 1,
+        "maxprice": 0,
+        "cc": "KR",
+        "l": "english",
+        "start": 0,
+        "count": 50,
+        "json": 1,
+    }
+
+    data = await http_json(
+        STEAM_SEARCH_URL,
+        params=params,
+    )
+
+    results = []
+
+    if data:
+
+        items = (
+            data.get("items")
+            or []
+        )
+
+        for item in items:
+
+            appid = item.get("id")
+
+            if not appid:
+                continue
+
+            game = await build_steam_game(
+                appid
+            )
+
+            if not game:
+                continue
+
+            if game.get(
+                "is_free"
+            ):
+                results.append(
+                    game
+                )
+
+    return results
+
+
+# =========================================================
+# FREE EMBEDS
+# =========================================================
+
+def free_game_key(game):
+    return (
+        f"{game.get('store')}::"
+        f"{game.get('id')}::"
+        f"{normalize_text(game.get('title'))}"
+    )
+
 
 def make_free_embed(
-    store,
-    game
+    game,
 ):
-    if store == "epic":
-        color = 0x7C3AED
-        store_name = "EPIC GAMES STORE"
-        icon = "🟣"
-    else:
-        color = 0x1B9FFF
-        store_name = "STEAM"
-        icon = "🔵"
+    store = game.get(
+        "store",
+        "Game",
+    )
+
+    title = game.get(
+        "title",
+        "Game",
+    )
+
+    if store == "Epic":
+
+        embed = discord.Embed(
+            title=f"🎁 {title}",
+            description=(
+                "⚡ **GAME ĐANG FREE** ⚡\n\n"
+                f"🏪 Store: **Epic Games Store**\n"
+                "💰 Giá hiện tại: **FREE**"
+            ),
+            color=0x7C3AED,
+            url=game.get("url"),
+        )
+
+        if game.get("start_date"):
+            embed.add_field(
+                name="📅 Bắt đầu",
+                value=discord_timestamp(
+                    game["start_date"]
+                ),
+                inline=True,
+            )
+
+        if game.get("end_date"):
+            embed.add_field(
+                name="⏳ Hết FREE",
+                value=discord_timestamp(
+                    game["end_date"]
+                ),
+                inline=True,
+            )
+
+            embed.add_field(
+                name="🔥 Còn lại",
+                value=countdown(
+                    game["end_date"]
+                ),
+                inline=True,
+            )
+
+        if game.get("image"):
+            embed.set_image(
+                url=game["image"]
+            )
+
+        embed.set_footer(
+            text="🎁 Free Game • Epic Games Store"
+        )
+
+        return embed
 
     embed = discord.Embed(
-        title=(
-            "⚡✨🎁・GAME FREE "
-            "CHỚP CHỚP・🎁✨⚡"
-        ),
+        title=f"🎁 {title}",
         description=(
-            f"{icon} **{store_name}**\n\n"
-            f"🎮 **{game['title']}**\n\n"
-            "🟢 **MIỄN PHÍ 100%**\n"
-            "🎁 Nhận game ngay trước khi hết hạn!"
+            "⚡ **GAME ĐANG FREE** ⚡\n\n"
+            f"🏪 Store: **Steam**\n"
+            "💰 Giá hiện tại: **FREE**"
         ),
-        color=color,
-        url=game["url"]
+        color=0x1B9AAA,
+        url=game.get("url"),
     )
 
-    original_krw = game.get(
-        "original_krw"
-    )
-
-    original_vnd = game.get(
-        "original_vnd"
-    )
-
-    if original_krw:
-        embed.add_field(
-            name="💰 Giá gốc KRW",
-            value=(
-                f"~~₩{int(original_krw):,}~~"
-            ),
-            inline=True
+    if game.get("image"):
+        embed.set_image(
+            url=game["image"]
         )
 
-    if original_vnd:
-        embed.add_field(
-            name="💵 Giá gốc VNĐ",
-            value=(
-                f"~~{int(original_vnd):,}₫~~"
-            ),
-            inline=True
-        )
-
-    embed.add_field(
-        name="🎁 Giá hiện tại",
-        value="**FREE**",
-        inline=True
+    embed.set_footer(
+        text="🎁 Free Game • Steam"
     )
 
-    if game.get("start_date"):
-        embed.add_field(
-            name="📅 Bắt đầu",
-            value=format_datetime(
-                game.get(
-                    "start_date"
+    return embed
+
+
+# =========================================================
+# SEARCH DETAIL EMBEDS
+# =========================================================
+
+def make_game_detail_embed(
+    game,
+):
+    store = game.get(
+        "store"
+    )
+
+    title = game.get(
+        "title",
+        "Game",
+    )
+
+    if store == "Epic":
+
+        price_kr = game.get(
+            "price_kr"
+        )
+
+        price_vn = game.get(
+            "price_vn"
+        )
+
+        if price_kr:
+            kr_original = price_kr.get(
+                "original"
+            )
+
+            kr_discount = price_kr.get(
+                "discount"
+            )
+
+            if (
+                kr_discount is not None
+                and kr_discount == 0
+            ):
+                kr_text = "FREE"
+            elif (
+                kr_original is not None
+                and kr_discount is not None
+                and kr_discount
+                != kr_original
+            ):
+                kr_text = (
+                    f"₩{kr_discount:,}"
+                    f" ~~₩{kr_original:,}~~"
                 )
+            elif kr_original is not None:
+                kr_text = (
+                    f"₩{kr_original:,}"
+                )
+            else:
+                kr_text = "Không rõ"
+        else:
+            kr_text = "Không rõ"
+
+        if price_vn:
+            vn_original = price_vn.get(
+                "original"
+            )
+
+            vn_discount = price_vn.get(
+                "discount"
+            )
+
+            if (
+                vn_discount is not None
+                and vn_discount == 0
+            ):
+                vn_text = "FREE"
+            elif (
+                vn_original is not None
+                and vn_discount is not None
+                and vn_discount
+                != vn_original
+            ):
+                vn_text = (
+                    f"{vn_discount:,}₫"
+                    f" ~~{vn_original:,}₫~~"
+                )
+            elif vn_original is not None:
+                vn_text = (
+                    f"{vn_original:,}₫"
+                )
+            else:
+                vn_text = "Không rõ"
+        else:
+            vn_text = "Không rõ"
+
+        embed = discord.Embed(
+            title=f"🎮 {title}",
+            description=truncate(
+                game.get(
+                    "description",
+                    "",
+                ),
+                1000,
             ),
-            inline=True
+            color=0x7C3AED,
+            url=game.get("url"),
         )
 
-    if game.get("end_date"):
         embed.add_field(
-            name="⏳ Hết hạn",
+            name="🟣 Epic Games Store",
+            value="",
+            inline=False,
+        )
+
+        embed.add_field(
+            name="🇰🇷 Giá KRW",
+            value=kr_text,
+            inline=True,
+        )
+
+        embed.add_field(
+            name="🇻🇳 Giá VNĐ",
+            value=vn_text,
+            inline=True,
+        )
+
+        if game.get("developer"):
+            embed.add_field(
+                name="👨‍💻 Developer",
+                value=truncate(
+                    game["developer"],
+                    100,
+                ),
+                inline=True,
+            )
+
+        if game.get("publisher"):
+            embed.add_field(
+                name="🏢 Publisher",
+                value=truncate(
+                    game["publisher"],
+                    100,
+                ),
+                inline=True,
+            )
+
+        embed.add_field(
+            name="🔗 Link",
             value=(
-                f"{format_datetime(game.get('end_date'))}\n"
-                f"⚡ Còn: "
-                f"**{countdown_text(game.get('end_date'))}**"
+                f"[Mở Epic Games Store]"
+                f"({game.get('url')})"
             ),
-            inline=True
+            inline=False,
         )
 
-    if game.get("image"):
-        embed.set_image(
-            url=game["image"]
+        if game.get("image"):
+            embed.set_image(
+                url=game["image"]
+            )
+
+        embed.set_footer(
+            text="Epic Games Store"
         )
 
-    embed.set_footer(
-        text=(
-            "⚡🎁 Free Game Bot • "
-            "Đừng quên claim game!"
-        )
-    )
+        return embed
 
-    return embed
+    # -------------------------
+    # STEAM
+    # -------------------------
 
-
-# =========================================================
-# EPIC SCHEDULE EMBED
-# =========================================================
-
-def make_schedule_embed(
-    game
-):
     embed = discord.Embed(
-        title=(
-            "📅⚡・SẮP CÓ GAME FREE・⚡📅"
+        title=f"🎮 {title}",
+        description=truncate(
+            game.get(
+                "description",
+                "",
+            ),
+            1000,
         ),
-        description=(
-            "✨ Canh lịch để nhận game miễn phí!\n\n"
-            f"🎮 **{game['title']}**\n"
-            "🟣 **Epic Games Store**"
-        ),
-        color=0x7C3AED,
-        url=game["url"]
+        color=0x1B9AAA,
+        url=game.get("url"),
     )
 
-    if game.get("start_date"):
+    embed.add_field(
+        name="🔵 Steam",
+        value="",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🇰🇷 Giá KRW",
+        value=game.get(
+            "price_kr_text",
+            "Không rõ",
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🇻🇳 Giá VNĐ",
+        value=game.get(
+            "price_vn_text",
+            "Không rõ",
+        ),
+        inline=True,
+    )
+
+    genres = game.get(
+        "genres"
+    ) or []
+
+    if genres:
         embed.add_field(
-            name="📅 Ngày bắt đầu",
-            value=(
-                f"**{format_datetime(game['start_date'])}**\n"
-                f"⚡ Còn khoảng: "
-                f"**{countdown_text(game['start_date'])}**"
+            name="🎭 Thể loại",
+            value=truncate(
+                ", ".join(genres),
+                300,
             ),
-            inline=False
+            inline=False,
         )
 
-    if game.get("end_date"):
+    if game.get(
+        "release_date"
+    ):
         embed.add_field(
-            name="⏳ Ngày kết thúc",
-            value=format_datetime(
-                game["end_date"]
+            name="📅 Phát hành",
+            value=game[
+                "release_date"
+            ],
+            inline=True,
+        )
+
+    if game.get(
+        "developer"
+    ):
+        embed.add_field(
+            name="👨‍💻 Developer",
+            value=truncate(
+                game["developer"],
+                100,
             ),
-            inline=True
+            inline=True,
+        )
+
+    if game.get(
+        "publisher"
+    ):
+        embed.add_field(
+            name="🏢 Publisher",
+            value=truncate(
+                game["publisher"],
+                100,
+            ),
+            inline=True,
         )
 
     embed.add_field(
-        name="🗓 Hôm nay",
-        value=now_utc().astimezone().strftime(
-            "%d/%m/%Y"
+        name="🔗 Link",
+        value=(
+            f"[Mở Steam]"
+            f"({game.get('url')})"
         ),
-        inline=True
+        inline=False,
     )
 
     if game.get("image"):
@@ -1869,38 +2427,250 @@ def make_schedule_embed(
         )
 
     embed.set_footer(
-        text=(
-            "📅⚡ Free Game Bot • "
-            "Canh giờ nhận game"
-        )
+        text="Steam Store"
     )
 
     return embed
 
 
 # =========================================================
-# STORE BUTTON
+# PAGINATION VIEW
 # =========================================================
 
-class StoreLinkView(
+RESULTS_PER_PAGE = 20
+
+
+class ResultButton(
+    discord.ui.Button
+):
+    def __init__(
+        self,
+        game,
+        index,
+    ):
+        self.game = game
+
+        label = truncate(
+            game.get(
+                "title",
+                "Game",
+            ),
+            70,
+        )
+
+        if game.get(
+            "store"
+        ) == "Epic":
+            label = f"🟣 {label}"
+            style = discord.ButtonStyle.primary
+        else:
+            label = f"🔵 {label}"
+            style = discord.ButtonStyle.secondary
+
+        super().__init__(
+            label=label,
+            style=style,
+            row=index // 4,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        embed = make_game_detail_embed(
+            self.game
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+class PaginationView(
     discord.ui.View
 ):
     def __init__(
         self,
-        url,
-        label
+        results,
+        title,
+        color=0x5865F2,
     ):
         super().__init__(
-            timeout=None
+            timeout=300
         )
 
-        self.add_item(
-            discord.ui.Button(
-                label=label,
-                url=url,
-                style=discord.ButtonStyle.link
+        self.results = results
+        self.title = title
+        self.color = color
+
+        self.page = 0
+
+        self.total_pages = max(
+            1,
+            (
+                len(results)
+                + RESULTS_PER_PAGE
+                - 1
+            )
+            // RESULTS_PER_PAGE,
+        )
+
+        self.refresh()
+
+    def current_items(self):
+        start = (
+            self.page
+            * RESULTS_PER_PAGE
+        )
+
+        end = (
+            start
+            + RESULTS_PER_PAGE
+        )
+
+        return self.results[
+            start:end
+        ]
+
+    def build_embed(self):
+        items = self.current_items()
+
+        embed = discord.Embed(
+            title=self.title,
+            color=self.color,
+        )
+
+        if not items:
+            embed.description = (
+                "❌ Không tìm thấy game."
+            )
+
+            return embed
+
+        lines = []
+
+        start_index = (
+            self.page
+            * RESULTS_PER_PAGE
+        )
+
+        for i, game in enumerate(
+            items,
+            start=start_index + 1,
+        ):
+            store = game.get(
+                "store"
+            )
+
+            icon = (
+                "🟣"
+                if store == "Epic"
+                else "🔵"
+            )
+
+            title = truncate(
+                game.get(
+                    "title",
+                    "Game",
+                ),
+                70,
+            )
+
+            lines.append(
+                f"**{i}.** {icon} {title}"
+            )
+
+        embed.description = (
+            "\n".join(lines)
+            + "\n\n"
+            "👇 Bấm vào tên game để xem "
+            "giá + ảnh + link."
+        )
+
+        embed.set_footer(
+            text=(
+                f"Trang {self.page + 1}"
+                f"/{self.total_pages}"
+                f" • {len(self.results)} game"
             )
         )
+
+        return embed
+
+    def refresh(self):
+        self.clear_items()
+
+        items = self.current_items()
+
+        for index, game in enumerate(
+            items
+        ):
+            self.add_item(
+                ResultButton(
+                    game,
+                    index,
+                )
+            )
+
+        # navigation
+        nav_row = 4
+
+        previous = discord.ui.Button(
+            label="⬅️ Trang trước",
+            style=discord.ButtonStyle.secondary,
+            disabled=(
+                self.page <= 0
+            ),
+            row=nav_row,
+        )
+
+        next_button = discord.ui.Button(
+            label="Trang sau ➡️",
+            style=discord.ButtonStyle.secondary,
+            disabled=(
+                self.page
+                >= self.total_pages - 1
+            ),
+            row=nav_row,
+        )
+
+        async def previous_callback(
+            interaction
+        ):
+            if self.page > 0:
+                self.page -= 1
+                self.refresh()
+
+            await interaction.response.edit_message(
+                embed=self.build_embed(),
+                view=self,
+            )
+
+        async def next_callback(
+            interaction
+        ):
+            if self.page < (
+                self.total_pages - 1
+            ):
+                self.page += 1
+                self.refresh()
+
+            await interaction.response.edit_message(
+                embed=self.build_embed(),
+                view=self,
+            )
+
+        previous.callback = (
+            previous_callback
+        )
+
+        next_button.callback = (
+            next_callback
+        )
+
+        self.add_item(previous)
+        self.add_item(next_button)
 
 
 # =========================================================
@@ -1908,162 +2678,487 @@ class StoreLinkView(
 # =========================================================
 
 class GameSearchModal(
-    discord.ui.Modal
+    discord.ui.Modal,
+    title="🔎 Tìm game",
 ):
-    def __init__(self, store):
-        super().__init__(
-            title=(
-                "🔎 Tìm game - "
-                + (
-                    "Epic"
-                    if store == "epic"
-                    else "Steam"
-                )
-            )
-        )
-
-        self.store = store
-
-        self.game_name = discord.ui.TextInput(
-            label="Tên game",
-            placeholder=(
-                "Ví dụ: gta / hitman / fifa / minecraft"
-            ),
-            required=True,
-            min_length=1,
-            max_length=100
-        )
-
-        self.add_item(
-            self.game_name
-        )
+    query = discord.ui.TextInput(
+        label="Tên game",
+        placeholder=(
+            "Ví dụ: gta / hitman / fifa / minecraft"
+        ),
+        required=True,
+        max_length=100,
+    )
 
     async def on_submit(
         self,
-        interaction: discord.Interaction
+        interaction: discord.Interaction,
     ):
-        query = clean_text(
-            self.game_name.value
+        await interaction.response.defer()
+
+        query = str(
+            self.query
+        ).strip()
+
+        if not query:
+            await interaction.followup.send(
+                "❌ Nhập tên game.",
+                ephemeral=True,
+            )
+            return
+
+        # mặc định tìm cả 2 store
+        epic_task = epic_search(
+            query
         )
+
+        steam_task = steam_search(
+            query
+        )
+
+        epic_results, steam_results = (
+            await asyncio.gather(
+                epic_task,
+                steam_task,
+                return_exceptions=True,
+            )
+        )
+
+        if isinstance(
+            epic_results,
+            Exception,
+        ):
+            print(
+                "EPIC SEARCH ERROR:",
+                epic_results,
+            )
+            epic_results = []
+
+        if isinstance(
+            steam_results,
+            Exception,
+        ):
+            print(
+                "STEAM SEARCH ERROR:",
+                steam_results,
+            )
+            steam_results = []
+
+        combined = []
+
+        combined.extend(
+            epic_results
+        )
+
+        combined.extend(
+            steam_results
+        )
+
+        if not combined:
+            await interaction.followup.send(
+                (
+                    f"❌ Không tìm thấy **{query}**.\n\n"
+                    "Thử tên ngắn hơn, ví dụ:\n"
+                    "• `gta`\n"
+                    "• `hitman`\n"
+                    "• `fifa`\n"
+                    "• `minecraft`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # score chung
+        combined.sort(
+            key=lambda x: (
+                x.get("_score", 0),
+                normalize_text(
+                    x.get(
+                        "title",
+                        "",
+                    )
+                ),
+            ),
+            reverse=True,
+        )
+
+        view = PaginationView(
+            combined,
+            f"🔎 KẾT QUẢ: {query}",
+        )
+
+        await interaction.followup.send(
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+
+
+# =========================================================
+# GENRE SELECT
+# =========================================================
+
+class GenreSelect(
+    discord.ui.Select
+):
+    def __init__(self):
+        options = []
+
+        emoji_map = {
+            "Kinh dị": "👻",
+            "Hành động": "⚔️",
+            "Phiêu lưu": "🗺️",
+            "RPG": "🧙",
+            "Thể thao": "⚽",
+            "Đua xe": "🏎️",
+            "Chiến thuật": "♟️",
+            "Indie": "🎨",
+            "Mô phỏng": "🏗️",
+            "Casual": "🎮",
+        }
+
+        for name in GENRES:
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    emoji=emoji_map.get(
+                        name,
+                        "🎮",
+                    ),
+                    value=name,
+                )
+            )
+
+        super().__init__(
+            placeholder=(
+                "🎭 Chọn thể loại game..."
+            ),
+            options=options,
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction,
+    ):
+        genre = self.values[0]
 
         await interaction.response.defer(
             ephemeral=True
         )
 
-        async with aiohttp.ClientSession() as session:
+        try:
+            results = await search_genre(
+                genre
+            )
 
-            if self.store == "epic":
-                results = await search_epic(
-                    session,
-                    query
-                )
+        except Exception as e:
+            print(
+                "GENRE ERROR:",
+                e,
+            )
 
-            else:
-                results = await search_steam(
-                    session,
-                    query
-                )
+            await interaction.followup.send(
+                "❌ Lỗi khi tìm thể loại.",
+                ephemeral=True,
+            )
+
+            return
 
         if not results:
             await interaction.followup.send(
-                embed=make_no_result_embed(
-                    self.store,
-                    query
+                (
+                    f"❌ Không tìm thấy game "
+                    f"thể loại **{genre}**."
                 ),
-                ephemeral=True
+                ephemeral=True,
             )
             return
 
-        embed = make_search_embed(
-            self.store,
-            query,
-            results
+        view = PaginationView(
+            results,
+            f"🎭 THỂ LOẠI: {genre}",
         )
 
         await interaction.followup.send(
-            embed=embed,
-            ephemeral=True
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
         )
 
 
-# =========================================================
-# STORE SEARCH BUTTONS
-# =========================================================
-
-class StoreSearchView(
+class GenreView(
     discord.ui.View
 ):
     def __init__(self):
         super().__init__(
-            timeout=300
+            timeout=180
         )
 
-    @discord.ui.button(
-        label="Epic",
-        emoji="🟣",
-        style=discord.ButtonStyle.primary
-    )
-    async def epic_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        await interaction.response.send_modal(
-            GameSearchModal("epic")
-        )
-
-    @discord.ui.button(
-        label="Steam",
-        emoji="🔵",
-        style=discord.ButtonStyle.primary
-    )
-    async def steam_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        await interaction.response.send_modal(
-            GameSearchModal("steam")
+        self.add_item(
+            GenreSelect()
         )
 
 
 # =========================================================
-# /GAME
+# FREE GAME VIEW
+# =========================================================
+
+async def get_all_current_free():
+    epic_task = get_epic_free_games()
+    steam_task = get_steam_free_games()
+
+    epic, steam = await asyncio.gather(
+        epic_task,
+        steam_task,
+        return_exceptions=True,
+    )
+
+    if isinstance(
+        epic,
+        Exception,
+    ):
+        print(
+            "EPIC FREE ERROR:",
+            epic,
+        )
+        epic = []
+
+    if isinstance(
+        steam,
+        Exception,
+    ):
+        print(
+            "STEAM FREE ERROR:",
+            steam,
+        )
+        steam = []
+
+    current = []
+
+    for game in epic:
+        if game.get(
+            "is_active"
+        ):
+            current.append(game)
+
+    for game in steam:
+        current.append(game)
+
+    # chống duplicate
+    unique = {}
+
+    for game in current:
+        key = free_game_key(
+            game
+        )
+
+        unique[key] = game
+
+    return list(
+        unique.values()
+    )
+
+
+# =========================================================
+# MAIN /GAME PANEL
+# =========================================================
+
+class GamePanelView(
+    discord.ui.View
+):
+    def __init__(self):
+        super().__init__(
+            timeout=None
+        )
+
+    @discord.ui.button(
+        label="TÌM GAME",
+        emoji="🔎",
+        style=discord.ButtonStyle.primary,
+        custom_id="game_panel_search",
+        row=0,
+    )
+    async def search_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.send_modal(
+            GameSearchModal()
+        )
+
+    @discord.ui.button(
+        label="FREE HIỆN TẠI",
+        emoji="🎁",
+        style=discord.ButtonStyle.success,
+        custom_id="game_panel_free",
+        row=0,
+    )
+    async def free_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        await interaction.response.defer(
+            ephemeral=True
+        )
+
+        try:
+            results = (
+                await get_all_current_free()
+            )
+
+        except Exception as e:
+            print(
+                "FREE BUTTON ERROR:",
+                e,
+            )
+
+            await interaction.followup.send(
+                "❌ Không thể lấy danh sách FREE.",
+                ephemeral=True,
+            )
+            return
+
+        if not results:
+            await interaction.followup.send(
+                (
+                    "😢 Hiện tại chưa lấy được "
+                    "game FREE nào."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        view = PaginationView(
+            results,
+            "🎁 GAME FREE HIỆN TẠI",
+            color=0x2ECC71,
+        )
+
+        await interaction.followup.send(
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="THỂ LOẠI",
+        emoji="🎭",
+        style=discord.ButtonStyle.secondary,
+        custom_id="game_panel_genre",
+        row=0,
+    )
+    async def genre_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        embed = discord.Embed(
+            title="🎭 CHỌN THỂ LOẠI",
+            description=(
+                "Chọn thể loại bên dưới.\n\n"
+                "👻 Kinh dị\n"
+                "⚔️ Hành động\n"
+                "🗺️ Phiêu lưu\n"
+                "🧙 RPG\n"
+                "⚽ Thể thao\n"
+                "🏎️ Đua xe\n"
+                "♟️ Chiến thuật\n"
+                "🎨 Indie\n"
+                "🏗️ Mô phỏng\n"
+                "🎮 Casual"
+            ),
+            color=0x9B59B6,
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=GenreView(),
+            ephemeral=True,
+        )
+
+
+# =========================================================
+# SEND /GAME PANEL
+# =========================================================
+
+async def send_game_panel(channel):
+    embed = discord.Embed(
+        title="🎮 GAME CENTER",
+        description=(
+            "✨ **TÌM GAME • FREE GAME • THỂ LOẠI** ✨\n\n"
+            "🔎 **TÌM GAME**\n"
+            "Tìm game trên Epic + Steam.\n\n"
+            "🎁 **FREE HIỆN TẠI**\n"
+            "Xem game đang FREE ngay lúc này.\n\n"
+            "🎭 **THỂ LOẠI**\n"
+            "Chọn thể loại rồi xem danh sách game.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💰 Có giá **KRW + VNĐ**\n"
+            "🖼️ Có ảnh game\n"
+            "🔗 Có link store\n"
+            "🎮 Bấm tên game để xem chi tiết."
+        ),
+        color=0x5865F2,
+    )
+
+    embed.set_footer(
+        text="Epic Games Store • Steam"
+    )
+
+    await channel.send(
+        embed=embed,
+        view=GamePanelView(),
+    )
+
+
+# =========================================================
+# /GAME COMMAND
 # =========================================================
 
 @bot.tree.command(
     name="game",
-    description="Tìm game trên Epic hoặc Steam"
+    description="Mở Game Center",
 )
 async def game_command(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
 ):
-    embed = discord.Embed(
-        title=(
-            "🎮⚡・TÌM GAME"
-        ),
-        description=(
-            "Chọn cửa hàng muốn tìm:\n\n"
-            "🟣 **Epic**\n"
-            "🔵 **Steam**\n\n"
-            "💡 Chỉ cần nhập một phần tên.\n"
-            "Ví dụ `hitman` sẽ liệt kê "
-            "các phiên bản Hitman mà store tìm thấy."
-        ),
-        color=0x5865F2
-    )
+    search_channel = find_search_channel(
+        interaction.guild
+    ) if interaction.guild else None
 
-    embed.set_footer(
-        text=(
-            "🎁 Free Game Bot • "
-            "Search nhiều phiên bản"
+    if (
+        search_channel
+        and interaction.channel_id
+        != search_channel.id
+    ):
+        await interaction.response.send_message(
+            (
+                f"❌ Lệnh này chỉ dùng trong "
+                f"{search_channel.mention}"
+            ),
+            ephemeral=True,
         )
+        return
+
+    embed = discord.Embed(
+        title="🎮 GAME CENTER",
+        description=(
+            "⚡ Chọn chức năng bên dưới ⚡\n\n"
+            "🔎 **Tìm Game**\n"
+            "Tìm GTA, HITMAN, FIFA, Minecraft...\n\n"
+            "🎁 **Free hiện tại**\n"
+            "Xem game đang FREE.\n\n"
+            "🎭 **Thể loại**\n"
+            "Lọc game theo thể loại."
+        ),
+        color=0x5865F2,
     )
 
     await interaction.response.send_message(
         embed=embed,
-        view=StoreSearchView(),
-        ephemeral=True
+        view=GamePanelView(),
     )
 
 
@@ -2073,381 +3168,256 @@ async def game_command(
 
 @bot.tree.command(
     name="channels",
-    description="Kiểm tra bot đang nhận diện channel nào"
+    description="Xem bot đang nhận diện channel nào",
 )
 async def channels_command(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
 ):
-    notification = find_channel(
-        interaction.guild,
-        NOTIFICATION_CHANNEL_NAME
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "❌ Chỉ dùng trong server.",
+            ephemeral=True,
+        )
+        return
+
+    notification = find_notification_channel(
+        interaction.guild
     )
 
-    search = find_channel(
-        interaction.guild,
-        SEARCH_CHANNEL_NAME
-    )
-
-    notification_text = (
-        notification.mention
-        if notification
-        else "❌ Không tìm thấy"
-    )
-
-    search_text = (
-        search.mention
-        if search
-        else "❌ Không tìm thấy"
+    search = find_search_channel(
+        interaction.guild
     )
 
     embed = discord.Embed(
-        title="📡・CHANNEL BOT",
-        description=(
-            f"🎁 Thông báo game: "
-            f"{notification_text}\n"
-            f"🎮 Tìm game: "
-            f"{search_text}"
+        title="📡 CHANNEL AUTO-DETECT",
+        color=0x5865F2,
+    )
+
+    embed.add_field(
+        name="🎁 Thông báo FREE",
+        value=(
+            notification.mention
+            if notification
+            else "❌ Không tìm thấy"
         ),
-        color=0x5865F2
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎮 Tìm game",
+        value=(
+            search.mention
+            if search
+            else "❌ Không tìm thấy"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=(
+            "Bot tự nhận diện tên channel "
+            "không cần /setchannel"
+        )
     )
 
     await interaction.response.send_message(
         embed=embed,
-        ephemeral=True
+        ephemeral=True,
     )
 
 
 # =========================================================
-# SEND EPIC SCHEDULE
+# NOTIFICATION
 # =========================================================
 
-async def send_epic_schedule(
+async def notify_free_game(
     channel,
-    games
+    game,
 ):
-    changed = False
+    key = free_game_key(
+        game
+    )
 
-    current = now_utc()
+    embed = make_free_embed(
+        game
+    )
 
-    for game in games:
+    await channel.send(
+        content=(
+            "🚨✨ **FREE GAME MỚI!** ✨🚨"
+        ),
+        embed=embed,
+    )
 
-        if game.get("active"):
-            continue
+    if key not in DATA[
+        "sent_free_games"
+    ]:
+        DATA[
+            "sent_free_games"
+        ].append(key)
 
-        start = parse_datetime(
-            game.get("start_date")
-        )
+    # giữ database gọn
+    DATA[
+        "sent_free_games"
+    ] = DATA[
+        "sent_free_games"
+    ][-500:]
 
-        if not start:
-            continue
-
-        if start <= current:
-            continue
-
-        unique_id = (
-            f"{game.get('id')}:"
-            f"{game.get('start_date')}:"
-            f"{game.get('end_date')}"
-        )
-
-        if unique_id in data[
-            "epic_schedule_sent"
-        ]:
-            continue
-
-        embed = make_schedule_embed(
-            game
-        )
-
-        try:
-            await channel.send(
-                embed=embed,
-                view=StoreLinkView(
-                    game["url"],
-                    "🎁 MỞ EPIC"
-                )
-            )
-
-            data[
-                "epic_schedule_sent"
-            ].append(
-                unique_id
-            )
-
-            changed = True
-
-        except Exception as e:
-            print(
-                "❌ Lỗi gửi Epic schedule:",
-                e
-            )
-
-    if changed:
-        save_data()
+    save_data()
 
 
-# =========================================================
-# SEND EPIC FREE
-# =========================================================
+async def check_free_games():
+    channels, _ = (
+        get_all_guilds_channels()
+    )
 
-async def send_epic_notifications(
-    channel,
-    games
-):
-    changed = False
-
-    for game in games:
-
-        if not game.get("active"):
-            continue
-
-        game_id = str(
-            game.get("id")
-        )
-
-        if game_id in data[
-            "epic_sent"
-        ]:
-            continue
-
-        # Lần chạy đầu không spam game cũ
-        if not data[
-            "first_run_done"
-        ] and not ANNOUNCE_EXISTING_ON_FIRST_RUN:
-
-            data[
-                "epic_sent"
-            ].append(game_id)
-
-            changed = True
-            continue
-
-        embed = make_free_embed(
-            "epic",
-            game
-        )
-
-        try:
-            await channel.send(
-                content=(
-                    "⚡✨🎁 "
-                    "@everyone "
-                    "GAME FREE MỚI "
-                    "🎁✨⚡"
-                ),
-                embed=embed,
-                view=StoreLinkView(
-                    game["url"],
-                    "🟣 MỞ EPIC"
-                ),
-                allowed_mentions=discord.AllowedMentions(
-                    everyone=True
-                )
-            )
-
-            data[
-                "epic_sent"
-            ].append(game_id)
-
-            changed = True
-
-        except Exception as e:
-            print(
-                "❌ Lỗi gửi Epic:",
-                e
-            )
-
-    if changed:
-        save_data()
-
-
-# =========================================================
-# SEND STEAM FREE
-# =========================================================
-
-async def send_steam_notifications(
-    channel,
-    games
-):
-    changed = False
-
-    for game in games:
-
-        game_id = str(
-            game.get("id")
-        )
-
-        if game_id in data[
-            "steam_sent"
-        ]:
-            continue
-
-        # Lần chạy đầu
-        if not data[
-            "first_run_done"
-        ] and not ANNOUNCE_EXISTING_ON_FIRST_RUN:
-
-            data[
-                "steam_sent"
-            ].append(game_id)
-
-            changed = True
-            continue
-
-        embed = make_free_embed(
-            "steam",
-            game
-        )
-
-        try:
-            await channel.send(
-                content=(
-                    "⚡✨🎁 "
-                    "@everyone "
-                    "STEAM ĐANG FREE "
-                    "🎁✨⚡"
-                ),
-                embed=embed,
-                view=StoreLinkView(
-                    game["url"],
-                    "🔵 MỞ STEAM"
-                ),
-                allowed_mentions=discord.AllowedMentions(
-                    everyone=True
-                )
-            )
-
-            data[
-                "steam_sent"
-            ].append(game_id)
-
-            changed = True
-
-        except Exception as e:
-            print(
-                "❌ Lỗi gửi Steam:",
-                e
-            )
-
-    if changed:
-        save_data()
-
-
-# =========================================================
-# FREE GAME CHECKER
-# =========================================================
-
-@tasks.loop(
-    minutes=CHECK_INTERVAL_MINUTES
-)
-async def free_game_checker():
-
-    channel = get_notification_channel()
-
-    if not channel:
+    if not channels:
         print(
-            "⚠️ Không tìm thấy channel:",
-            NOTIFICATION_CHANNEL_NAME
+            "⚠️ Không tìm thấy channel "
+            "thong-bao-game"
+        )
+
+        return
+
+    try:
+        games = (
+            await get_all_current_free()
+        )
+
+    except Exception as e:
+        print(
+            "FREE CHECK ERROR:",
+            e,
         )
         return
 
-    print(
-        "🔎 Đang kiểm tra game miễn phí..."
-    )
-
-    async with aiohttp.ClientSession() as session:
-
-        epic_task = get_epic_free_games(
-            session
-        )
-
-        steam_task = get_steam_free_games(
-            session
-        )
-
-        epic_games, steam_games = await asyncio.gather(
-            epic_task,
-            steam_task,
-            return_exceptions=True
-        )
-
-    if isinstance(
-        epic_games,
-        Exception
-    ):
+    if not games:
         print(
-            "❌ Epic checker:",
-            epic_games
+            "ℹ️ Không lấy được game FREE."
         )
-        epic_games = []
+        return
 
-    if isinstance(
-        steam_games,
-        Exception
-    ):
-        print(
-            "❌ Steam checker:",
-            steam_games
+    first_run = not DATA.get(
+        "first_run_done",
+        False,
+    )
+
+    for game in games:
+
+        key = free_game_key(
+            game
         )
-        steam_games = []
 
-    # Epic lịch
-    await send_epic_schedule(
-        channel,
-        epic_games
-    )
+        if key in DATA[
+            "sent_free_games"
+        ]:
+            continue
 
-    # Epic đang free
-    await send_epic_notifications(
-        channel,
-        epic_games
-    )
+        if first_run and not ANNOUNCE_EXISTING_ON_FIRST_RUN:
 
-    # Steam đang free
-    await send_steam_notifications(
-        channel,
-        steam_games
-    )
+            DATA[
+                "sent_free_games"
+            ].append(key)
 
-    data[
+            continue
+
+        for channel in channels:
+
+            try:
+                await notify_free_game(
+                    channel,
+                    game,
+                )
+
+                await asyncio.sleep(
+                    1
+                )
+
+            except Exception as e:
+                print(
+                    "NOTIFY ERROR:",
+                    e,
+                )
+
+    DATA[
         "first_run_done"
     ] = True
 
     save_data()
 
+
+@tasks.loop(
+    minutes=CHECK_INTERVAL_MINUTES
+)
+async def free_game_checker():
     print(
-        "✅ Kiểm tra game hoàn tất."
+        "🔎 Checking free games..."
     )
+
+    await check_free_games()
+
+
+@free_game_checker.before_loop
+async def before_checker():
+    await bot.wait_until_ready()
 
 
 # =========================================================
-# ERROR HANDLER
+# AUTO SEND GAME PANEL
 # =========================================================
 
-@bot.tree.error
-async def on_app_command_error(
-    interaction,
-    error
-):
-    print(
-        "❌ Slash command error:",
-        error
-    )
+async def ensure_game_panel():
+    """
+    Nếu tim-game tồn tại nhưng chưa có panel
+    thì bot gửi panel.
 
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                "❌ Có lỗi xảy ra.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Có lỗi xảy ra.",
-                ephemeral=True
+    Không tự spam mỗi lần restart.
+    """
+
+    for guild in bot.guilds:
+
+        channel = find_search_channel(
+            guild
+        )
+
+        if not channel:
+            continue
+
+        found_recent = False
+
+        try:
+            async for message in channel.history(
+                limit=50
+            ):
+                if (
+                    message.author.id
+                    == bot.user.id
+                ):
+                    if (
+                        message.embeds
+                        and message.components
+                    ):
+                        found_recent = True
+                        break
+
+        except Exception as e:
+            print(
+                "PANEL HISTORY ERROR:",
+                e,
             )
 
-    except Exception:
-        pass
+        if not found_recent:
+
+            try:
+                await send_game_panel(
+                    channel
+                )
+
+            except Exception as e:
+                print(
+                    "PANEL SEND ERROR:",
+                    e,
+                )
 
 
 # =========================================================
@@ -2458,67 +3428,152 @@ async def on_app_command_error(
 async def on_ready():
 
     print(
-        f"✅ Bot online: {bot.user}"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
 
     print(
-        f"🏠 Servers: {len(bot.guilds)}"
+        f"✅ BOT ONLINE: {bot.user}"
     )
 
-    for guild in bot.guilds:
+    print(
+        f"🆔 ID: {bot.user.id}"
+    )
 
-        notification = find_channel(
-            guild,
-            NOTIFICATION_CHANNEL_NAME
-        )
+    print(
+        f"🌐 Servers: {len(bot.guilds)}"
+    )
 
-        search = find_channel(
-            guild,
-            SEARCH_CHANNEL_NAME
-        )
-
-        print(
-            f"📡 {guild.name}"
-        )
-
-        print(
-            "   🎁 thông báo:",
-            notification.name
-            if notification
-            else "KHÔNG TÌM THẤY"
-        )
-
-        print(
-            "   🎮 tìm game:",
-            search.name
-            if search
-            else "KHÔNG TÌM THẤY"
-        )
+    print(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
     try:
         synced = await bot.tree.sync()
 
         print(
-            f"✅ Sync {len(synced)} slash command"
+            f"✅ Synced {len(synced)} slash commands"
         )
 
     except Exception as e:
         print(
-            "❌ Sync command lỗi:",
-            e
+            "❌ COMMAND SYNC ERROR:",
+            e,
         )
+
+    # persistent main view
+    try:
+        bot.add_view(
+            GamePanelView()
+        )
+    except Exception:
+        pass
 
     if not free_game_checker.is_running():
         free_game_checker.start()
 
+    # cho Discord có thời gian hoàn tất ready
+    await asyncio.sleep(3)
+
+    await ensure_game_panel()
+
 
 # =========================================================
-# START
+# GUILD JOIN
+# =========================================================
+
+@bot.event
+async def on_guild_join(
+    guild
+):
+    print(
+        f"➕ Joined guild: {guild.name}"
+    )
+
+    await asyncio.sleep(3)
+
+    channel = find_search_channel(
+        guild
+    )
+
+    if channel:
+        try:
+            await send_game_panel(
+                channel
+            )
+        except Exception as e:
+            print(
+                "GUILD PANEL ERROR:",
+                e,
+            )
+
+
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction,
+    error,
+):
+    print(
+        "SLASH COMMAND ERROR:",
+        error,
+    )
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "❌ Có lỗi xảy ra.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ Có lỗi xảy ra.",
+                ephemeral=True,
+            )
+
+    except Exception:
+        pass
+
+
+# =========================================================
+# SHUTDOWN
+# =========================================================
+
+async def close_session():
+    global http_session
+
+    if (
+        http_session
+        and not http_session.closed
+    ):
+        await http_session.close()
+
+
+# =========================================================
+# START BOT
 # =========================================================
 
 if not DISCORD_TOKEN:
     raise RuntimeError(
-        "❌ Thiếu DISCORD_TOKEN trong Railway Variables."
+        "❌ Chưa có biến môi trường DISCORD_TOKEN"
     )
 
-bot.run(DISCORD_TOKEN)
+
+try:
+    bot.run(
+        DISCORD_TOKEN
+    )
+
+finally:
+    try:
+        loop = asyncio.get_event_loop()
+
+        if not loop.is_closed():
+            loop.run_until_complete(
+                close_session()
+            )
+
+    except Exception:
+        pass
